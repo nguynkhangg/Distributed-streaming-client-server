@@ -2,19 +2,27 @@
 Constants and configuration for CCP Protocol
 """
 
+from enum import IntEnum
+
 # MAGIC & VERSION
 MAGIC = 0xA5C3
 VERSION = 1
 
 # PACKET TYPES
-class PacketType:
+class PacketType(IntEnum):
     HELLO = 0x01
     HELLO_ACK = 0x02
+    DATA = 0x03
+    ACK = 0x04
+    PING = 0x05
+    PONG = 0x06
+    CLOSE = 0x07
+
+    # Pending: needs recheck packet type values
     AUTH = 0x03
     AUTH_ACK = 0x04
     LOGOUT = 0x05
     LOGOUT_ACK = 0x06
-    CLOSE = 0x07
     HEARTBEAT = 0x08
     MSG_OFFER = 0x0A
     MSG = 0x0B
@@ -25,6 +33,7 @@ class PacketType:
     FILE_FIN = 0x17
     ONLINE_LIST = 0x20
     ERROR = 0xFF
+
 
 PACKET_TYPE_NAME = {
     0x01: "HELLO", 0x02: "HELLO_ACK", 0x03: "AUTH", 0x04: "AUTH_ACK",
@@ -54,6 +63,7 @@ class ErrorCode:
 
 # SIZES & LIMITS
 HEADER_SIZE = 16
+HEADER_FORMAT = "!HBBBBIIH"
 MAX_DATAGRAM_SIZE = 1200
 MAX_PAYLOAD_SIZE = MAX_DATAGRAM_SIZE - HEADER_SIZE
 DATA_SEGMENT_SIZE = 1000
@@ -69,6 +79,13 @@ MAX_RETRANSMISSIONS = 8
 DEFAULT_SERVER_PORT = 9000
 DEFAULT_CLIENT_HTTP_PORT = 8080
 DEFAULT_SERVER_HOST = "127.0.0.1"
+
+
+class CloseReason(IntEnum):
+    NORMAL = 0
+    TIMEOUT = 1
+    PROTOCOL_ERROR = 2
+    SERVER_SHUTDOWN = 3
 
 # ENCRYPTION
 ENCRYPTION_KEY_SIZE = 32
