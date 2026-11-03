@@ -23,6 +23,11 @@ except ImportError:  # run directly as a script: python src/server/server.py
                                  CloseReason, RemoveResult, SessionLimitError,
                                  SessionManager)
 
+from ..security.concurrency import shutdown_workers, submit_datagram
+from ..security.encryption import (DIR_C2S,DIR_S2C,GCM_TAG_SIZE,
+                                   CryptoError,derive_keys,derive_session_keys,
+                                   open as gcm_open,seal,x25519_shared_secret)
+
 log = logging.getLogger("ccp.server")
 
 # ---- TEMP wire-format helpers: delete and import from src/common/protocol.py once merged ----
@@ -147,16 +152,21 @@ class CcpServer:
                 log.error("recvfrom failed: %s", exc)
                 time.sleep(0.1)
                 continue
-            try:
-                self._handle_datagram(data, addr)
-            except Exception:  # section 16: one bad client must never stop the server
-                log.exception("error while handling datagram from %s", addr)
+            # Bounded pool so one slow client does not block recv (CSR concurrency)
+            submit_datagram(self._handle_datagram_safe, data, addr)
+
+    def _handle_datagram_safe(self, data: bytes, addr: Address) -> None:
+        try:
+            self._handle_datagram(data, addr)
+        except Exception:  # section 16: one bad client must never stop the server
+            log.exception("error while handling datagram from %s", addr)
 
     def shutdown(self) -> None:
         """Stop the loops, send CLOSE(server shutdown) to every client, release the socket."""
         self._stop.set()
         for result in self._sessions.remove_all():
             self._send_close(result.session, CloseReason.SERVER_SHUTDOWN)
+        shutdown_workers(wait=False)
         self._sock.close()
 
     def _sweep_loop(self) -> None:
@@ -195,9 +205,22 @@ class CcpServer:
                       header.packet_type.name, addr)
             return
         if header.flags & FLAG_ENC:
-            log.debug("drop %s from %s: ENC set but encryption not implemented",
-                      header.packet_type.name, addr)
-            return
+            if session.key_c2s is None:
+                log.debug("drop %s from %s: ENC before keys ready",
+                          header.packet_type.name, addr)
+                return
+            try:
+                payload = gcm_open(
+                    session.key_c2s,
+                    header.packet_number,
+                    data[:HEADER_SIZE],
+                    payload,
+                    direction=DIR_C2S,
+                )
+            except CryptoError:
+                log.debug("drop %s from %s: GCM auth failed",
+                          header.packet_type.name, addr)
+                return
         handler = self._handlers.get(header.packet_type)
         if handler is None:
             log.debug("drop %s from %s: not valid client-to-server",
@@ -227,6 +250,24 @@ class CcpServer:
             self._handle_removed(result.replaced, "client restarted")
         session = result.session
         if result.is_new:
+            # Real X25519 when client sent a non-zero public key; else compat fallback
+            if (
+                session.server_private_key is not None
+                and session.client_public_key != bytes(KEY_SIZE)
+            ):
+                shared = x25519_shared_secret(
+                    session.server_private_key, session.client_public_key
+                )
+                session.key_c2s, session.key_s2c = derive_session_keys(
+                    shared, session.client_nonce, session.server_nonce
+                )
+            else:
+                session.key_c2s, session.key_s2c = derive_keys(
+                    session.client_public_key,
+                    session.server_public_key,
+                    session.client_nonce,
+                    session.server_nonce,
+                )
             log.info("new session %08x for %s:%d", session.connection_id, *addr)
         else:
             log.debug("HELLO retransmission from %s: resend HELLO_ACK", addr)
@@ -260,8 +301,21 @@ class CcpServer:
 
     def _send(self, session: ClientSession, packet_type: PacketType,
               payload: bytes = b"") -> None:
-        raw = pack_packet(packet_type, session.connection_id,
-                          session.allocate_packet_number(), payload)
+        pn = session.allocate_packet_number()
+        # HELLO/HELLO_ACK stay plaintext; everything else uses ENC once keys exist
+        use_enc = (
+            session.key_s2c is not None
+            and packet_type not in (PacketType.HELLO, PacketType.HELLO_ACK)
+        )
+        if use_enc:
+            sealed_len = len(payload) + GCM_TAG_SIZE
+            header16 = struct.pack(HEADER_FORMAT,MAGIC,VERSION,
+                                   int(packet_type),FLAG_ENC,0,
+                                   session.connection_id,pn,sealed_len)
+            body = seal(session.key_s2c, pn, header16, payload, direction=DIR_S2C)
+            raw = header16 + body
+        else:
+            raw = pack_packet(packet_type,session.connection_id,pn,payload,0)
         try:
             self._sock.sendto(raw, session.address)
         except OSError as exc:

@@ -68,10 +68,14 @@ class ClientSession:
     client_nonce: bytes
     server_public_key: bytes
     server_nonce: bytes
+    server_private_key: bytes | None = None  # X25519; needed for ECDH
     state: SessionState = SessionState.ESTABLISHED
     username: str | None = None
     failed_auth_count: int = 0
     next_packet_number: int = 0
+    # Filled after HELLO (derive_session_keys or derive_keys fallback)
+    key_c2s: bytes | None = None
+    key_s2c: bytes | None = None
     created_at: float = field(default_factory=time.monotonic)
     last_recv: float = field(default_factory=time.monotonic)
     last_send: float = field(default_factory=time.monotonic)
@@ -140,15 +144,21 @@ class SessionManager:
                 raise SessionLimitError("too many sessions")
 
             connection_id = self._new_connection_id_locked()
-            server_key = (self._server_key_factory() if self._server_key_factory
-                          else bytes(KEY_SIZE))
+            if self._server_key_factory is not None:
+                server_public = self._server_key_factory()
+                server_private = None
+            else:
+                from ..security.encryption import generate_x25519_keypair
+
+                server_private, server_public = generate_x25519_keypair()
             session = ClientSession(
                 connection_id=connection_id,
                 address=address,
                 client_public_key=client_public_key,
                 client_nonce=client_nonce,
-                server_public_key=server_key,
+                server_public_key=server_public,
                 server_nonce=secrets.token_bytes(NONCE_SIZE),
+                server_private_key=server_private,
             )
             self._by_id[connection_id] = session
             self._by_address[address] = connection_id
