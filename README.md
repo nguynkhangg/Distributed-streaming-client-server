@@ -26,11 +26,11 @@ The implementation must demonstrate core network-programming concepts using raw 
 
 Fill this section in after the team confirms the implementation choices.
 
-- **Programming language:** TODO — Python / Java / C++ / Go
+- **Programming language:** Python
 - **Networking:** Raw sockets; final TCP/UDP responsibilities to be confirmed
-- **Concurrency:** TODO — multithreading or asynchronous I/O
+- **Concurrency:** Threading — shared `submit_datagram` pool + locked session table / heartbeat sweeper
 - **Serialization:** TODO — JSON, XML, or custom binary format
-- **Cryptography:** TODO — standard cryptographic library and agreed key-handling approach
+- **Cryptography:** AES-256-GCM + HKDF (`src/security`); hop-by-hop ENC after HELLO (see protocol-spec §12)
 - **UI:** TODO — implementation approach to be confirmed with the instructor
 - **Supported operating systems:** Windows, macOS, and Linux are listed in the assignment requirements
 
