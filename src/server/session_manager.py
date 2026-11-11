@@ -76,6 +76,9 @@ class ClientSession:
     # Filled after HELLO (derive_session_keys or derive_keys fallback)
     key_c2s: bytes | None = None
     key_s2c: bytes | None = None
+    use_encryption: bool = False
+    wire_mode: str = "packet"
+    stream_offsets: dict[int, int] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
     last_recv: float = field(default_factory=time.monotonic)
     last_send: float = field(default_factory=time.monotonic)
