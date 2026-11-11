@@ -90,9 +90,13 @@ class TestStreaprousFramework(unittest.TestCase):
         raw_conn.update_congestion_control_on_ack(key, is_new_ack=True)
         self.assertEqual(state["cwnd"], 3 * raw_conn.TCP_MSS)
 
-        # Flow control caps effective window at peer rwnd
+        # Flow control caps effective window at peer rwnd (including rwnd < TCP_MSS and rwnd == 0)
         raw_conn.update_flow_control_window(key, 2000)
         self.assertEqual(raw_conn.compute_effective_window(state), 2000)
+        raw_conn.update_flow_control_window(key, 500)
+        self.assertEqual(raw_conn.compute_effective_window(state), 500)
+        raw_conn.update_flow_control_window(key, 0)
+        self.assertEqual(raw_conn.compute_effective_window(state), 0)
 
         # 3 duplicate ACKs trigger Fast Retransmit
         self.assertFalse(raw_conn.update_congestion_control_on_ack(key, is_new_ack=False))

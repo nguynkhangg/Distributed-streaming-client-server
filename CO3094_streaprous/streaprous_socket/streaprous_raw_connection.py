@@ -109,16 +109,16 @@ def get_tcp_state(client_key):
 
 def compute_effective_window(state) -> int:
     """Flow Control + Congestion Control: effective send window = min(cwnd, rwnd)."""
-    return max(TCP_MSS, min(int(state["cwnd"]), int(state["rwnd"])))
+    return max(0, min(int(state["cwnd"]), int(state["rwnd"])))
 
 
 def update_flow_control_window(client_key, peer_window: int) -> int:
     """Update peer receive window (rwnd) and calculate local advertised window."""
     state = get_tcp_state(client_key)
     with connections_lock:
-        state["rwnd"] = max(TCP_MSS, int(peer_window)) if peer_window > 0 else TCP_MSS
+        state["rwnd"] = max(0, int(peer_window))
         buffered = sum(len(v) for v in state["rcv_buffer"].values())
-        state["local_rwnd"] = max(TCP_MSS, min(65535, MAX_RECV_BUFFER - buffered))
+        state["local_rwnd"] = max(0, min(65535, MAX_RECV_BUFFER - buffered))
         return state["local_rwnd"]
 
 
@@ -940,62 +940,78 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     state = get_tcp_state(client_key)
     packet_queue = get_packet_queue(client_key)
 
-    base_seq = session.server_seq
-    next_seq = base_seq
+    start_seq = session.server_seq
+    base_seq = start_seq
+    next_seq = start_seq
     total_len = len(payload)
-    end_seq = base_seq + total_len
+    end_seq = start_seq + total_len
     ack_seq = session.client_seq
 
-    # Pre-split payload into MSS-sized segments keyed by starting sequence number
+    # Track transmitted segments keyed by starting sequence number
     segments = {}
-    offset = 0
-    while offset < total_len:
-        chunk = payload[offset : offset + TCP_MSS]
-        segments[base_seq + offset] = {
-            "data": chunk,
-            "sent_at": None,
-            "retries": 0,
-            "retransmitted": False,
-        }
-        offset += len(chunk)
 
     try:
         while base_seq < end_seq:
             effective_win = compute_effective_window(state)
             local_rwnd = state.get("local_rwnd", DEFAULT_RWND)
 
-            # 1. Transmit new segments within min(cwnd, rwnd)
+            # 1. Transmit new segments within min(cwnd, rwnd) (supports windows < TCP_MSS)
             while next_seq < end_seq and (next_seq - base_seq) < effective_win:
-                seg = segments.get(next_seq)
-                if seg is None:
+                avail_win = effective_win - (next_seq - base_seq)
+                seg_len = min(TCP_MSS, avail_win, end_seq - next_seq)
+                if seg_len <= 0:
                     break
+                offset = next_seq - start_seq
+                chunk = payload[offset : offset + seg_len]
+                seg = {
+                    "data": chunk,
+                    "sent_at": time.time(),
+                    "retries": 0,
+                    "retransmitted": False,
+                }
+                segments[next_seq] = seg
                 send_tcp_data_segment(
                     s, listen_ip, client_ip, listen_port, client_port,
-                    seq=next_seq, ack_seq=ack_seq, payload=seg["data"], window=local_rwnd
+                    seq=next_seq, ack_seq=ack_seq, payload=chunk, window=local_rwnd
                 )
-                seg["sent_at"] = time.time()
-                next_seq += len(seg["data"])
+                next_seq += len(chunk)
 
             # 2. Wait for incoming ACK up to current RTO
             rto = state.get("rto", INITIAL_RTO)
             try:
                 pkt, _ = packet_queue.get(timeout=rto)
             except queue.Empty:
+                # Zero-window probe if peer advertised rwnd == 0 and nothing is in flight
+                if next_seq == base_seq and base_seq not in segments and base_seq < end_seq:
+                    offset = base_seq - start_seq
+                    probe = payload[offset : offset + 1]
+                    segments[base_seq] = {
+                        "data": probe,
+                        "sent_at": time.time(),
+                        "retries": 0,
+                        "retransmitted": False,
+                    }
+                    send_tcp_data_segment(
+                        s, listen_ip, client_ip, listen_port, client_port,
+                        seq=base_seq, ack_seq=ack_seq, payload=probe, window=local_rwnd
+                    )
+                    next_seq += len(probe)
+                    continue
+
                 # Timeout -> Congestion Control backoff & retransmit oldest unacked segment
                 seg = segments.get(base_seq)
                 if seg is None:
                     break
                 if seg["retries"] >= MAX_RETRANSMISSIONS:
-                    # Flush any remaining unsent segments before finishing
+                    # Flush any remaining unsent payload in MSS-sized chunks before finishing
                     while next_seq < end_seq:
-                        rem = segments.get(next_seq)
-                        if rem is None:
-                            break
+                        offset = next_seq - start_seq
+                        chunk = payload[offset : offset + TCP_MSS]
                         send_tcp_data_segment(
                             s, listen_ip, client_ip, listen_port, client_port,
-                            seq=next_seq, ack_seq=ack_seq, payload=rem["data"], window=local_rwnd
+                            seq=next_seq, ack_seq=ack_seq, payload=chunk, window=local_rwnd
                         )
-                        next_seq += len(rem["data"])
+                        next_seq += len(chunk)
                     base_seq = end_seq
                     break
                 update_congestion_control_on_timeout(client_key)
