@@ -106,17 +106,21 @@ class SendTracker:
     Lost data => resent in a new packet number
     """
 
-    def __init__(self):
+    def __init__(self, allocate_packet_number=None):
         self._next_packet_number = 0
+        self._external_allocate = allocate_packet_number
         self._in_flight: dict[int, SentPacket] = {}
         self.peer_window = FIXED_WINDOW
         self.srtt = None
         self.rttvar = None
         self.rto = INITIAL_RTO
         self._acked_numbers = []
+        self._lost_packets: dict[int, SentPacket] = {}
 
     def allocate_packet_number(self) -> int:
         """numbers never reused."""
+        if self._external_allocate is not None:
+            return self._external_allocate()
         packet_number = self._next_packet_number
         self._next_packet_number += 1
         return packet_number
@@ -152,6 +156,8 @@ class SendTracker:
         for packet in acked:
             del self._in_flight[packet.packet_number]
 
+        late = self._on_late_ack(ranges)
+
         newest = max(acked, key=lambda packet: packet.packet_number, default=None)
         if newest is not None and newest.packet_number == largest_acked:
             self._update_rtt(now - newest.sent_time)
@@ -175,7 +181,7 @@ class SendTracker:
             if oldest is not None and number > oldest:
                 new_list.append(number)
         self._acked_numbers = new_list
-        return acked, lost
+        return acked + late , lost
 
     def on_timer(self, now: float):
         """Return packets when RTO expired"""
@@ -188,9 +194,52 @@ class SendTracker:
             self._declare_lost(lost)
         return lost
 
+    def retransmit(self, lost, now: float):
+        """
+        Resend lost data in new packet (new packet number, same stream/offset/data)
+        Return the new SentPacket list
+        """
+        resent = []
+        for packet in lost:
+            new_packet = SentPacket(
+                packet_number=self.allocate_packet_number(),
+                stream_id=packet.stream_id,
+                offset=packet.offset,
+                data=packet.data,
+                fin=packet.fin,
+                sent_time=now,
+                retransmissions=packet.retransmissions + 1,
+            )
+            self.on_data_sent(new_packet)
+            resent.append(new_packet)
+        return resent
+    
+    def _on_late_ack(self, ranges):
+        """
+        A packet lost may ACKed later (only its ACK was lost).
+        if data was delivered => the resent copy still in flight counts as acked.
+        """
+        in_flight_keys = {(p.stream_id, p.offset) for p in self._in_flight.values()}
+        self._lost_packets = {
+            number: packet for number, packet in self._lost_packets.items()
+            if (packet.stream_id, packet.offset) in in_flight_keys
+        }
+
+        delivered = set()
+        for number, packet in list(self._lost_packets.items()):
+            if any(start <= number <= end for start, end in ranges):
+                delivered.add((packet.stream_id, packet.offset))
+                del self._lost_packets[number]
+
+        copies = [p for p in self._in_flight.values() if (p.stream_id, p.offset) in delivered]
+        for packet in copies:
+            del self._in_flight[packet.packet_number]
+        return copies
+
     def _declare_lost(self, lost) -> None:
         for packet in lost:
             del self._in_flight[packet.packet_number]
+            self._lost_packets[packet.packet_number] = packet
             if packet.retransmissions >= MAX_RETRANSMISSIONS:
                 raise ConnectionFailed("Retransmission limit reached")
 
