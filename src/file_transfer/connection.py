@@ -18,7 +18,7 @@ from .packet import (FLAG_FIN, MAX_DATA_BYTES, TYPE_ACK, TYPE_DATA,
                      decode_ack_payload, decode_data_payload, encode_data_payload)
 from .reliability import AckTracker, SentPacket, SendTracker
 
-RECV_WINDOW = 256  # packets the receiver can buffer (spec 11: 256 KiB relay buffer)
+RECV_WINDOW = 256  
 
 
 @dataclass(frozen=True)
@@ -30,8 +30,8 @@ class OutgoingPacket:
 
 
 class ReliableConnection:
-    def __init__(self, allocate_packet_number=None, on_stream_data=None):
-        self._send = SendTracker(allocate_packet_number)
+    def __init__(self, allocate_packet_number=None, on_stream_data=None, congestion=None):
+        self._send = SendTracker(allocate_packet_number,congestion)
         self._ack = AckTracker()
         self._on_stream_data = on_stream_data
         self.recv_window = RECV_WINDOW  
