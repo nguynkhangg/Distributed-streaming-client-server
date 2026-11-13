@@ -16,7 +16,9 @@ from dataclasses import dataclass
 
 from .packet import (FLAG_FIN, MAX_DATA_BYTES, TYPE_ACK, TYPE_DATA,
                      decode_ack_payload, decode_data_payload, encode_data_payload)
-from .reliability import FIXED_WINDOW, AckTracker, SentPacket, SendTracker
+from .reliability import AckTracker, SentPacket, SendTracker
+
+RECV_WINDOW = 256  # packets the receiver can buffer (spec 11: 256 KiB relay buffer)
 
 
 @dataclass(frozen=True)
@@ -32,7 +34,7 @@ class ReliableConnection:
         self._send = SendTracker(allocate_packet_number)
         self._ack = AckTracker()
         self._on_stream_data = on_stream_data
-        self.recv_window = FIXED_WINDOW  
+        self.recv_window = RECV_WINDOW  
 
         self._queues: dict[int, deque] = {}  
         self._sources: dict[int, object] = {}  
@@ -114,7 +116,7 @@ class ReliableConnection:
             out.append(self._data_packet(packet))
         self._resend = []
 
-        while self._send.can_send():
+        while self._send.can_send(now):
             segment = self._next_segment()
             if segment is None:
                 break

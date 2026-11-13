@@ -2,7 +2,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from file_transfer.models import TransferMetadata
+from .models import TransferMetadata
 
 
 class FileReceiver:
