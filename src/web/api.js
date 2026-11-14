@@ -8,7 +8,9 @@
  * MOCK = dữ liệu giả chạy ngay trong trình duyệt, để làm giao diện khi agent chưa có.
  * Khi agent thật đã chạy và phục vụ các endpoint /api/*, hãy chuyển sang dùng agent thật:
  *   Cách 1 (tắt vĩnh viễn): đổi `const USE_MOCK = true;` thành `const USE_MOCK = false;` bên dưới.
- *   Cách 2 (thử nhanh, không sửa code): thêm ?mock=0 vào URL, ví dụ http://127.0.0.1:8080/?mock=0
+ *            ĐÂY LÀ CÁCH DUY NHẤT khi trang do agent (StreapRous) phục vụ: framework trả 404 cho
+ *            mọi URL có ?query, nên http://127.0.0.1:8080/?mock=0 sẽ không mở được.
+ *   Cách 2 (chỉ khi mở thẳng file index.html hoặc dùng server khác): thêm ?mock=0 vào URL
  *            (ngược lại ?mock=1 ép bật mock dù USE_MOCK = false).
  * Trước khi nộp bài nhớ đặt USE_MOCK = false. Có thể xóa luôn hàm createMockApi() ở cuối file.
  *
@@ -16,23 +18,25 @@
  *   - Thêm ?as=alice vào URL để tự đăng nhập (bỏ qua màn hình login).
  *   - Password "wrong" -> lỗi AUTH_FAILED; username bob/carol/dave -> lỗi ALREADY_LOGGED_IN.
  *   - Gửi tin cho dave (sẽ offline sau 20 giây) -> lỗi USER_OFFLINE.
- *   - Tên file chứa "reject" -> bị từ chối; chứa "fail" -> truyền đến ~60% rồi lỗi.
- *   - Số liệu RTT / mất gói trong "Network status" là SỐ GIẢ ngẫu nhiên, không đo mạng thật.
+ *   - Bấm Attach hiện hộp thoại giả (prompt) hỏi tên file: tên chứa "reject" -> bị từ chối;
+ *     chứa "fail" -> truyền đến ~60% rồi lỗi. (Với agent thật, hộp thoại chọn file do agent mở.)
  *
  * ================= HỢP ĐỒNG VỚI AGENT (đề xuất, chưa được nhóm duyệt) =================
- * Trang web chỉ nói chuyện HTTP với agent (cùng origin, 127.0.0.1):
+ * Trang web chỉ nói chuyện HTTP với agent (cùng origin, 127.0.0.1). Theo protocol-spec.md mục 13,
+ * agent chạy trên StreapRous của thầy (không được sửa): route khớp đúng đường dẫn nên KHÔNG có
+ * ?query, MỌI lệnh là POST với body JSON, body phải nhỏ (< 350 byte), mã HTTP luôn là 200.
  *   POST /api/login          {username, password}      -> {ok}; kết quả đến sau qua sự kiện "auth_ack"
- *   POST /api/send           {target, text}            -> {ok}   (target "*" = gửi cho tất cả)
- *   POST /api/file/offer?target=<user>&filename=<tên>   body = byte thô của file -> {ok, ref}
+ *   POST /api/send           {target, text}            -> {ok}   (target "*" = gửi cho tất cả; text <= 250 byte UTF-8)
+ *   POST /api/file/offer     {target}                  -> {ok, ref, filename, size_bytes}
+ *                            (agent tự mở hộp thoại chọn file của hệ điều hành; ref = null nếu đóng hộp thoại)
  *   POST /api/file/respond   {file_id, accepted}       -> {ok}   (nhận / từ chối file đến)
  *   POST /api/logout         {}                        -> {ok}
- *   GET  /api/events?since=<n>   long-polling          -> {events: [...], next: <n>}
- * Khi lỗi, agent trả {ok:false, code, message} với code lấy từ bảng mã lỗi (spec mục 14).
+ *   POST /api/events         {since}  long-polling     -> {events: [...], next: <n>}
+ * Khi lỗi, agent trả {ok:false, code, message} (vẫn HTTP 200) với code lấy từ bảng mã lỗi (spec mục 14).
  *
  * Các SỰ KIỆN agent gửi qua /api/events (mỗi sự kiện là một object có trường "type").
  * Định dạng này do UI đề xuất, spec chưa định nghĩa, cần thống nhất với Khang:
  *   conn          {state: disconnected|connecting|established|authenticated|closing}
- *   net           {rtt_ms, loss}                          (tùy chọn; thiếu thì UI hiện "—")
  *   auth_ack      {success, username, error}
  *   user_list     {users: [{username, ip, port, status}]}
  *   presence      {username, status: online|offline}
@@ -70,15 +74,7 @@ const Api = (() => {
     send: (target, text) => post("/api/send", { target, text }),
     respondFile: (file_id, accepted) => post("/api/file/respond", { file_id, accepted }),
     logout: () => post("/api/logout", {}),
-    async offerFile(target, file) {
-      const q = new URLSearchParams({ target, filename: file.name });
-      const res = await fetch("/api/file/offer?" + q, {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: file,
-      });
-      return res.json();
-    },
+    offerFile: (target) => post("/api/file/offer", { target }),
     /** Long-poll loop. onEvents(list) per batch; onLink(true|false) when the agent is (un)reachable. */
     startEvents(onEvents, onLink) {
       let since = 0;
@@ -86,8 +82,7 @@ const Api = (() => {
         let delay = 500;
         for (;;) {
           try {
-            const res = await fetch("/api/events?since=" + since);
-            const data = await res.json();
+            const data = await post("/api/events", { since });
             since = data.next;
             onLink(true);
             delay = 500;
@@ -157,7 +152,6 @@ function createMockApi() {
   function startSession() {
     emit({ type: "conn", state: "authenticated" });
     emit({ type: "user_list", users: userList() });
-    emit({ type: "net", rtt_ms: 12, loss: 0.004 });
     later(1500, () => emit({ type: "msg", sender: "bob", target: "*", text: "Hi everyone, does anyone have the chapter 3 slides?", timestamp: Date.now() / 1000 }));
     later(4000, () => emit({ type: "msg", sender: "carol", target: me, text: "Group meeting tonight at 8, okay?", timestamp: Date.now() / 1000 }));
     later(6000, () => { online.add("eve"); emit({ type: "presence", username: "eve", status: "online" }); });
@@ -167,10 +161,6 @@ function createMockApi() {
       emit({ type: "file_incoming", file_id: id, sender: "carol", filename: "demo_slides.pdf", size_bytes: 3200000 });
     });
     later(20000, () => { online.delete("dave"); emit({ type: "presence", username: "dave", status: "offline" }); });
-    const netTimer = setInterval(() => emit({
-      type: "net", rtt_ms: 8 + Math.round(Math.random() * 14), loss: Math.random() * 0.02,
-    }), 2000);
-    timers.push(netTimer);
   }
 
   const api = {
@@ -197,7 +187,11 @@ function createMockApi() {
       if (target === "bob") later(1000, () => emit({ type: "msg", sender: "bob", target: me, text: "(mock) bob got: " + text, timestamp: Date.now() / 1000 }));
       return { ok: true };
     },
-    async offerFile(target, file) {
+    async offerFile(target) {
+      // Mock of the native file dialog the real agent opens: ask for a file name instead.
+      const name = window.prompt("Mock file dialog: name of the file to send", "report.pdf");
+      if (!name) return { ok: true, ref: null };
+      const file = { name, size: 4200000 };
       await sleep(150);
       if (!online.has(target)) return { ok: false, code: "USER_OFFLINE", message: "" };
       const ref = "r" + ++seq;
@@ -209,7 +203,7 @@ function createMockApi() {
         if (file.name.includes("reject")) { t.state = "rejected"; emit(fileEvent(t)); }
         else runTransfer(t);
       });
-      return { ok: true, ref };
+      return { ok: true, ref, filename: file.name, size_bytes: file.size };
     },
     async respondFile(file_id, accepted) {
       const t = transfers.get(file_id);
