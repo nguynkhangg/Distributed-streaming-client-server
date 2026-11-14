@@ -1,6 +1,6 @@
 import bisect
 from dataclasses import dataclass
-
+from .congestion import FixedWindow
 from .packet import encode_ack_payload
 
 ACK_EVERY_DATA_PACKETS = 2
@@ -10,7 +10,7 @@ INITIAL_RTO = 1.0
 MIN_RTO = 0.2
 MAX_RETRANSMISSIONS = 8
 FIXED_WINDOW = 16
-
+INITIAL_PEER_WINDOW = 16
 
 class ConnectionFailed(Exception):
     """Time out with MAX_RETRANSMISSIONS times => Dead"""
@@ -106,16 +106,17 @@ class SendTracker:
     Lost data => resent in a new packet number
     """
 
-    def __init__(self, allocate_packet_number=None):
+    def __init__(self, allocate_packet_number=None, congestion=None):
         self._next_packet_number = 0
         self._external_allocate = allocate_packet_number
         self._in_flight: dict[int, SentPacket] = {}
-        self.peer_window = FIXED_WINDOW
+        self.peer_window = INITIAL_PEER_WINDOW
         self.srtt = None
         self.rttvar = None
         self.rto = INITIAL_RTO
         self._acked_numbers = []
         self._lost_packets: dict[int, SentPacket] = {}
+        self.congestion = congestion if congestion is not None else FixedWindow(FIXED_WINDOW)
 
     def allocate_packet_number(self) -> int:
         """numbers never reused."""
@@ -125,14 +126,18 @@ class SendTracker:
         self._next_packet_number += 1
         return packet_number
 
-    def can_send(self) -> bool:
-        return len(self._in_flight) < max(1,min(FIXED_WINDOW, self.peer_window)) #Tránh deadlock do window_rêcive = 0
+    def can_send(self, now: float = None) -> bool:
+        limit = max(1, min(self.congestion.cwnd, self.peer_window))  # at least 1, avoid deadlock when recv_window = 0
+        if len(self._in_flight) >= limit:
+            return False
+        return now is None or self.congestion.ready(now)
 
     @property
     def in_flight_count(self) -> int:
         return len(self._in_flight)
 
     def on_data_sent(self, packet: SentPacket) -> None:
+        self.congestion.on_sent(packet, packet.sent_time, len(self._in_flight))
         self._in_flight[packet.packet_number] = packet
 
     def on_ack(self, largest_acked, recv_window, ranges, now):
@@ -163,14 +168,15 @@ class SendTracker:
             self._update_rtt(now - newest.sent_time)
 
         self._acked_numbers.extend(packet.packet_number for packet in acked)
-
+        self.congestion.on_acked(acked, now, self.srtt, len(self._in_flight))
         lost = []
         for packet_number, packet in self._in_flight.items():
             acked_after = sum(1 for number in self._acked_numbers if number > packet_number)
             if acked_after >= PACKET_THRESHOLD:
                 lost.append(packet)
         self._declare_lost(lost)
-
+        if lost:
+                self.congestion.on_lost(lost, now)
         if self._in_flight:
             oldest = min(self._in_flight)
         else:
@@ -192,6 +198,7 @@ class SendTracker:
         if lost:
             self.rto *= 2 #double when timeout
             self._declare_lost(lost)
+            self.congestion.on_timeout(now)
         return lost
 
     def retransmit(self, lost, now: float):
