@@ -78,6 +78,10 @@ def forward_request(host, port, request):
         ).encode('utf-8')
 
 
+_rr_lock = threading.Lock()
+_rr_counters = {}
+
+
 def resolve_routing_policy(hostname, routes):
     """
     Handles an routing policy to return the matching proxy_pass.
@@ -99,21 +103,19 @@ def resolve_routing_policy(hostname, routes):
         if len(proxy_map) == 0:
             print("[Proxy] Emtpy resolved routing of hostname {}".format(hostname))
             print("Empty proxy_map result")
-            # TODO: implement the error handling for non mapped host
+            # TODO (DONE): implement the error handling for non mapped host
             #       the policy is design by team, but it can be 
             #       basic default host in your self-defined system
-            # Use a dummy host to raise an invalid connection
+            
             proxy_host = '127.0.0.1'
             proxy_port = '9000'
-        elif len(value) == 1:
+        elif len(proxy_map) == 1:
             proxy_host, proxy_port = proxy_map[0].split(":", 2)
-        #elif: # apply the policy handling 
-        #   proxy_map
-        #   policy
         else:
-            # Out-of-handle mapped host
-            proxy_host = '127.0.0.1'
-            proxy_port = '9000'
+            with _rr_lock:
+                idx = _rr_counters.get(hostname, 0) % len(proxy_map)
+                _rr_counters[hostname] = idx + 1
+            proxy_host, proxy_port = proxy_map[idx].split(":", 2)
     else:
         print("[Proxy] resolve route of hostname {} is a singulair to".format(hostname))
         proxy_host, proxy_port = proxy_map.split(":", 2)
@@ -142,6 +144,7 @@ def handle_client(ip, port, conn, addr, routes):
     request = conn.recv(1024).decode()
 
     # Extract hostname
+    hostname = ""
     for line in request.splitlines():
         if line.lower().startswith('host:'):
             hostname = line.split(':', 1)[1].strip()
@@ -195,10 +198,16 @@ def run_proxy(ip, port, routes):
         while True:
             conn, addr = proxy.accept()
             #
-            #  TODO: implement the step of the client incomping connection
+            #  TODO (DONE): implement the step of the client incomping connection
             #        using multi-thread programming with the
             #        provided handle_client routine
             #
+            client_thread = threading.Thread(
+                target=handle_client,
+                args=(ip, port, conn, addr, routes),
+                daemon=True
+            )
+            client_thread.start()
     except socket.error as e:
       print("Socket error: {}".format(e))
 

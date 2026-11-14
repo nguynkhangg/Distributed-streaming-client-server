@@ -131,9 +131,15 @@ class HttpAdapter:
         try:
             if req.hook:
                 #
-                # TODO: handle for App hook here
+                # TODO (DONE): handle for App hook here
                 #
-                response = b""
+                hook_res = req.hook(req.headers, req.body)
+                if inspect.isawaitable(hook_res):
+                    hook_res = asyncio.run(hook_res)
+                body_bytes = hook_res if isinstance(hook_res, bytes) else str(hook_res).encode("utf-8")
+                resp.headers["Content-Type"] = "application/json"
+                resp._content = body_bytes
+                response = resp.build_response_header(req) + body_bytes
             else:
                 # Build response
                 response = resp.build_response(req)
@@ -172,15 +178,22 @@ class HttpAdapter:
             return
 
         # Prepare request
-        msg = data.decode("utf-8")
+        msg = data.decode("utf-8", errors="replace")
         req.prepare(msg, routes)
         
         # Handle request hook
         if req.hook:
             #
-            # TODO: handle for App hook here
+            # TODO (DONE): handle for App hook here
             #
-            response = ""
+
+            hook_res = req.hook(req.headers, req.body)
+            if inspect.isawaitable(hook_res):
+                hook_res = asyncio.run(hook_res)
+            body_bytes = hook_res if isinstance(hook_res, bytes) else str(hook_res).encode("utf-8")
+            resp.headers["Content-Type"] = "application/json"
+            resp._content = body_bytes
+            response = resp.build_response_header(req) + body_bytes
         else:
             # Build response - returns bytes
             response = resp.build_response(req)
@@ -189,8 +202,9 @@ class HttpAdapter:
         response = response if isinstance(response, bytes) else response.encode("utf-8")
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
         #
-        # TODO run_conn_send packet
+        # TODO (DONE) run_conn_send packet
         # run_conn_send(..)
+        run_conn_send(raw_socket, conn_info, response)
         
         # Wait longer to ensure response is transmitted, client processes it, and sends ACK
         import time
@@ -198,8 +212,9 @@ class HttpAdapter:
         
         # Close connection with FIN packet
         #
-        # TODO run_conn_send packet
+        # TODO (DONE) run_conn_send packet
         # close_connection(...)
+        close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """

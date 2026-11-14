@@ -81,7 +81,7 @@ class Request():
             if path == '/':
                 path = '/index.html'
         except Exception:
-            return None, None
+            return None, None, None
 
         return method, path, version
              
@@ -113,26 +113,24 @@ class Request():
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
         #
-        # TODO:  Parse headers and body 
+        # TODO(DONE):  Parse headers and body 
         # with self.fetch_headers_body(request)
         # and self.prepare_headers(self._raw_headers)
         #
 
-        # self._raw_headers = ... 
-        # self._raw_body =...
-        # self.headers = ...
-        
-        self.prepare_headers(self._raw_headers)
+        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
+        self.headers = self.prepare_headers(self._raw_headers)
+        self.body = self._raw_body
         print("[Request] Parsed headers: {}".format(self.headers))
 
         #
         # @bksysnet Preapring the webapp hook with StreapRous instance
         # The default behaviour with HTTP server is empty routed
         #
-        # TODO manage the webapp hook in this mounting point
+        # TODO(DONE) manage the webapp hook in this mounting point
         #
         
-        if not routes == {}:
+        if routes:
             self.routes = routes
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
             self.hook = routes.get((self.method, self.path))
@@ -144,8 +142,15 @@ class Request():
 
         cookies = self.headers.get('cookie', '')
             #
-            #  TODO: implement the cookie function here
+            #  TODO (DONE): implement the cookie function here
             #        by parsing the header            #
+
+        self.cookies = {}
+        if cookies:
+            for pair in cookies.split(';'):
+                if '=' in pair:
+                    k, v = pair.strip().split('=', 1)
+                    self.cookies[k.strip()] = v.strip()
 
         return
 

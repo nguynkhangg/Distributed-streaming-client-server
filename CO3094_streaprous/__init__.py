@@ -10,12 +10,18 @@
 # while attending the course
 #
 
-from app.sampleapp import create_sampleapp
-from daemon.backend import create_backend
-from daemon.proxy import create_proxy
-from daemon.streaprous import StreapRous
-from daemon.response import Response
-from daemon.request import Request
-from daemon.backend import create_backend
-from daemon.httpadapter import HttpAdapter
-from daemon.dictionary import CaseInsensitiveDict
+import os as _os
+import sys as _sys
+
+_pkg_dir = _os.path.dirname(_os.path.abspath(__file__))
+if _pkg_dir not in _sys.path:
+    _sys.path.insert(0, _pkg_dir)
+
+from .apps.sampleapp import create_sampleapp
+from .daemon.backend import create_backend
+from .daemon.proxy import create_proxy
+from .daemon.streaprous import StreapRous
+from .daemon.response import Response
+from .daemon.request import Request
+from .daemon.httpadapter import HttpAdapter
+from .daemon.dictionary import CaseInsensitiveDict
