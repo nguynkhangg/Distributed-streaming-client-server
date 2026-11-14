@@ -48,7 +48,7 @@ except ImportError:
     )
 
 try:
-    from ..security.concurrency import shutdown_workers, submit_datagram
+    from ..security.concurrency import session_lock, shutdown_workers, submit_datagram
     from ..security.encryption import (
         DIR_C2S,
         DIR_S2C,
@@ -60,8 +60,9 @@ try:
         seal,
         x25519_shared_secret,
     )
+    from ..security.resilience import ActiveTransferRegistry
 except ImportError:
-    from src.security.concurrency import shutdown_workers, submit_datagram
+    from src.security.concurrency import session_lock, shutdown_workers, submit_datagram
     from src.security.encryption import (
         DIR_C2S,
         DIR_S2C,
@@ -73,6 +74,7 @@ except ImportError:
         seal,
         x25519_shared_secret,
     )
+    from src.security.resilience import ActiveTransferRegistry
 
 log = logging.getLogger("ccp.server")
 
@@ -240,6 +242,7 @@ class CcpServer:
             "MSG": self._handle_msg,
             "LOGOUT": self._handle_logout,
         }
+        self._active_transfers = ActiveTransferRegistry()
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -293,10 +296,14 @@ class CcpServer:
     def shutdown(self) -> None:
         """Stop background threads, notify active sessions with CLOSE, and release socket."""
         self._stop.set()
+        self._active_transfers.cancel_all()
         for result in self._sessions.remove_all():
             self._send_close(result.session, CloseReason.SERVER_SHUTDOWN)
-        shutdown_workers(wait=False)
-        self._sock.close()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        shutdown_workers(wait=True)
 
     def _sweep_loop(self) -> None:
         while not self._stop.wait(SWEEP_INTERVAL):
@@ -321,7 +328,8 @@ class CcpServer:
             log.debug("drop datagram from %s: %s", addr, exc)
             return
         if header.packet_type is PacketType.HELLO:
-            self._on_hello(header, payload, addr)
+            with session_lock(("hello", addr)):
+                self._on_hello(header, payload, addr)
             return
 
         session = self._sessions.lookup(header.connection_id, addr)
@@ -333,43 +341,65 @@ class CcpServer:
             )
             return
 
-        if header.flags & FLAG_ENC:
-            if session.key_c2s is None:
-                log.debug(
-                    "drop %s from %s: ENC before keys ready",
-                    header.packet_type.name,
-                    addr,
-                )
-                return
-            try:
-                payload = gcm_open(
-                    session.key_c2s,
-                    header.packet_number,
-                    data[:HEADER_SIZE],
-                    payload,
-                    direction=DIR_C2S,
-                )
-            except CryptoError:
-                log.debug(
-                    "drop %s from %s: GCM auth failed",
-                    header.packet_type.name,
-                    addr,
-                )
-                return
-            session.use_encryption = True
-        else:
-            session.use_encryption = False
+        # Same connection_id: handle one packet at a time (pool is shared).
+        with session_lock(session.connection_id):
+            if header.flags & FLAG_ENC:
+                if session.key_c2s is None:
+                    log.debug(
+                        "drop %s from %s: ENC before keys ready",
+                        header.packet_type.name,
+                        addr,
+                    )
+                    return
+                try:
+                    payload = gcm_open(
+                        session.key_c2s,
+                        header.packet_number,
+                        data[:HEADER_SIZE],
+                        payload,
+                        direction=DIR_C2S,
+                    )
+                except CryptoError:
+                    log.debug(
+                        "drop %s from %s: GCM auth failed",
+                        header.packet_type.name,
+                        addr,
+                    )
+                    return
+                session.use_encryption = True
+            else:
+                # After HELLO keys exist, ENC is required (§12).
+                if session.key_c2s is not None:
+                    log.debug(
+                        "drop %s from %s: ENC required after HELLO",
+                        header.packet_type.name,
+                        addr,
+                    )
+                    return
+                session.use_encryption = False
 
-        handler = self._handlers.get(header.packet_type)
-        if handler is None:
-            log.debug(
-                "drop %s from %s: not valid client-to-server",
-                header.packet_type.name,
-                addr,
-            )
-            return
-        session.touch()
-        handler(session, payload)
+            # Anti-replay: packet numbers must strictly increase.
+            if header.packet_number <= session.last_recv_pn:
+                log.debug(
+                    "drop %s from %s: replay/old pn %d (last=%d)",
+                    header.packet_type.name,
+                    addr,
+                    header.packet_number,
+                    session.last_recv_pn,
+                )
+                return
+            session.last_recv_pn = header.packet_number
+
+            handler = self._handlers.get(header.packet_type)
+            if handler is None:
+                log.debug(
+                    "drop %s from %s: not valid client-to-server",
+                    header.packet_type.name,
+                    addr,
+                )
+                return
+            session.touch()
+            handler(session, payload)
 
     def _on_hello(self, header: PacketHeader, payload: bytes, addr: Address) -> None:
         if header.connection_id != 0:
@@ -415,6 +445,7 @@ class CcpServer:
                     session.client_nonce,
                     session.server_nonce,
                 )
+            session.use_encryption = True
             log.info("new session %08x for %s:%d", session.connection_id, *addr)
         else:
             log.debug("HELLO retransmission from %s: resend HELLO_ACK", addr)
@@ -479,6 +510,7 @@ class CcpServer:
     def _handle_removed(self, result: RemoveResult, why: str) -> None:
         session = result.session
         log.info("session %08x (%s:%d) closed: %s", session.connection_id, *session.address, why)
+        self._active_transfers.cancel_for_connection(session.connection_id)
         if result.went_offline:
             with self._presence_lock:
                 self._fan_out(
@@ -772,6 +804,8 @@ class CcpServer:
         session: ClientSession,
         packet_type: PacketType,
         payload: bytes = b"",
+        *,
+        flags: int = 0,
     ) -> None:
         pn = session.allocate_packet_number()
         use_enc = (
@@ -779,6 +813,7 @@ class CcpServer:
             and session.key_s2c is not None
             and packet_type not in (PacketType.HELLO, PacketType.HELLO_ACK)
         )
+        wire_flags = flags | (FLAG_ENC if use_enc else 0)
         if use_enc:
             sealed_len = len(payload) + GCM_TAG_SIZE
             header16 = struct.pack(
@@ -786,7 +821,7 @@ class CcpServer:
                 MAGIC,
                 VERSION,
                 int(packet_type),
-                FLAG_ENC,
+                wire_flags,
                 0,
                 session.connection_id,
                 pn,
@@ -795,7 +830,7 @@ class CcpServer:
             body = seal(session.key_s2c, pn, header16, payload, direction=DIR_S2C)
             raw = header16 + body
         else:
-            raw = pack_packet(packet_type, session.connection_id, pn, payload, 0)
+            raw = pack_packet(packet_type, session.connection_id, pn, payload, wire_flags)
         try:
             self._sock.sendto(raw, session.address)
         except OSError as exc:

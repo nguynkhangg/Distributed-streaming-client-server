@@ -77,6 +77,8 @@ class ClientSession:
     key_c2s: bytes | None = None
     key_s2c: bytes | None = None
     use_encryption: bool = False
+    # Anti-replay: last accepted inbound packet number (strictly increasing).
+    last_recv_pn: int = -1
     wire_mode: str = "packet"
     stream_offsets: dict[int, int] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
@@ -84,6 +86,13 @@ class ClientSession:
     last_send: float = field(default_factory=time.monotonic)
     _pn_lock: threading.Lock = field(
         init=False, repr=False, default_factory=threading.Lock)
+
+    def clear_keys(self) -> None:
+        """Drop session key material (handshake fail / teardown)."""
+        self.key_c2s = None
+        self.key_s2c = None
+        self.server_private_key = None
+        self.use_encryption = False
 
     def allocate_packet_number(self) -> int:
         """Return the next server-to-client packet number (never reused)."""
@@ -193,6 +202,10 @@ class SessionManager:
         with self._lock:
             return [self._by_id[cid] for cid in self._by_username.values()]
 
+    def all_sessions(self) -> list[ClientSession]:
+        with self._lock:
+            return list(self._by_id.values())
+
     def online_users(self) -> list[dict]:
         """Payload entries for USER_LIST."""
         return [{"username": s.username, "ip": s.address[0],
@@ -249,6 +262,7 @@ class SessionManager:
             del self._by_username[session.username]
             went_offline = True
         session.state = SessionState.CLOSED
+        session.clear_keys()
         return RemoveResult(session, went_offline)
 
     def find_expired(self, now: float | None = None) -> list[ClientSession]:
