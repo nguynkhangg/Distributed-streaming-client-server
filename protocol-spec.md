@@ -292,18 +292,58 @@ Rules:
 - Limitation: `HELLO` is not authenticated, so a man-in-the-middle attack during the handshake is not prevented. Pinning the server public key in the client configuration is a possible improvement.
 - Encryption can be disabled during early development; the final version must have `ENC` enabled.
 
-## 13. Web UI
+## 13. Web UI and local HTTP API
+### 13.1 StreapRous constraints
 
-Browsers cannot send UDP datagrams and WebSockets are prohibited, so each client machine runs the agent.
+Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API below is shaped by them.
 
-- The agent contains an HTTP/1.1 server written with raw TCP sockets, bound to `127.0.0.1` only (default port 8080). It serves `index.html`, `app.js`, and `style.css`.
-- Per the instructor, HTML contains no data or application logic. JavaScript only renders agent state and forwards user actions. Authentication, encryption, ACKs, retransmission, reassembly, and hashing stay in the agent.
-- The agent returns updates to the browser through long-polling (`GET /api/events?since=<n>`). SSE is an alternative; not decided.
-- User commands use `POST /api/login`, `/api/send`, `/api/file/offer`, `/api/file/respond`, `/api/logout`.
-- The UI must show incoming messages, the active-user list, file transfer progress bars, and connection status.
-- **Open issue:** a browser cannot pass a file path to the agent. Proposed: the page uploads the selected file to the agent over localhost HTTP, and the agent sends it over CCP. Confirm this is acceptable.
+- **Start-up:** the stock `create_backend()` rejects `127.0.0.1` (and any other address needs raw sockets and root). The agent's own launcher calls `daemon.backend.run_backend_standard(ip, port, app.routes)` instead: normal sockets, one thread per connection, no root.
+- **Routes match the exact path.** `?query` and path parameters give `404`, so every parameter travels in a JSON body and every API call is a `POST`.
+- **A request is read with one `recv(1024)`, headers included.** Chrome headers take about 600 bytes, so the JSON body must stay **under 350 bytes** (400 B worked 15/15, 500 B failed 15/15). Chat text is limited to **250 bytes of UTF-8**.
+- **The status line is always `HTTP/1.1 200`.** Errors are reported in the body only.
+- Responses have no size limit. Long-polling works: 10 held requests at once, other requests are not blocked. Static files: `.html` from `www/`, `.js` from `static/`.
 
-A CLI client built on the same agent core can be used for initial protocol testing.
+### 13.2 Conventions
+
+- The agent serves `index.html`, `api.js`, `app.js` (no stylesheet). Page and API share one origin.
+- JSON in both directions. Success: `{"ok": true, ...}`. Failure: `{"ok": false, "code": "<section 14 code>", "message": "..."}`, still with HTTP `200`.
+- A command is answered when the agent has accepted it; the result arrives as an event. Not logged in: `NOT_AUTHENTICATED`. Bad JSON or fields: `INVALID_PAYLOAD`.
+
+### 13.3 Endpoints (all `POST`, JSON body)
+
+| Endpoint | Request | Response | CCP message |
+|---|---|---|---|
+| `/api/login` | `{"username", "password"}` | `{"ok": true}` | `HELLO` if disconnected, then `AUTH`. Result: `auth_ack` event |
+| `/api/send` | `{"target", "text"}` (`target` is `"*"` or a username; text up to 250 bytes) | `{"ok": true}` | `MSG`. Unknown/offline target: `error` event |
+| `/api/file/offer` | `{"target"}` | `{"ok": true, "ref": "<id>", "filename", "size_bytes"}`, or `"ref": null` if the user closes the dialog | The agent opens a native file dialog on this machine, computes size and SHA-256, sends `FILE_OFFER` |
+| `/api/file/respond` | `{"file_id", "accepted"}` | `{"ok": true}` | `FILE_RESPONSE` |
+| `/api/logout` | `{}` | `{"ok": true}` | `LOGOUT`, `CLOSE` |
+| `/api/events` | `{"since": <n>}` | `{"events": [...], "next": <n>}` | - |
+
+The server does not echo a sender's own messages, so the UI shows its own message locally after `ok`. File bytes never pass through the browser: the agent reads the chosen file itself. `ref` identifies a sent file until the server assigns `file_id`. If the server refuses an offer, the agent sends an `error` event and a `file` event with `state: "rejected"`.
+
+### 13.4 Events (long-polling)
+
+`/api/events` returns events with `seq > since`. If there are none, the agent holds the request up to 25 s, then answers `{"events": [], "next": <since>}`. The page calls again with `since=<next>`. `since=0` returns a snapshot: current `conn`, then `auth_ack`, `user_list` and one `file` event per unfinished transfer (no chat history).
+
+| `type` | Fields | Source |
+|---|---|---|
+| `conn` | `state`: `disconnected`, `connecting`, `established`, `authenticated`, `closing` | Client state machine (section 15) |
+| `auth_ack` | `success`, `username`, `error` | `AUTH_ACK` |
+| `user_list` | `users: [{username, ip, port, status}]` | `USER_LIST` |
+| `presence` | `username`, `status` | `PRESENCE` |
+| `msg` | `sender`, `target`, `text`, `timestamp` (Unix seconds) | `MSG_DELIVER` |
+| `file_incoming` | `file_id`, `sender`, `filename`, `size_bytes` | `FILE_INCOMING` |
+| `file` | `file_id`, `ref`, `direction` (`send`/`recv`), `peer`, `filename`, `size_bytes`, `state`, `transferred_bytes` | Transfer state |
+| `error` | `code`, `message`, `related_type` | `ERROR` |
+
+`file.state` is the lower-case state from the file transfer diagram (section 15). It is sent on every change and, while `transferring`, at most about 4 times per second. `completed` is sent only after size and SHA-256 are verified.
+
+### 13.5 Open issues
+
+- Confirm with the instructor that calling `run_backend_standard` from the agent's own launcher is acceptable (no file in `CO3094_streaprous/` changes).
+- File selection uses a native dialog opened by the agent (Python `tkinter`), because a browser cannot hand a file to this framework (see 13.1). If that is not acceptable, the user would type a file path instead.
+- Received files: the agent should move the verified file to a `downloads/` folder; there is no download endpoint yet.
 
 ## 14. Error codes
 
