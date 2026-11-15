@@ -1,6 +1,7 @@
 "use strict";
 /*
- * app.js — LOGIC GIAO DIỆN: vẽ màn hình và xử lý thao tác của người dùng. Không chứa logic mạng.
+ * app.js — LOGIC GIAO DIỆN: vẽ màn hình (bằng thẻ HTML cơ bản, không CSS) và xử lý thao tác của người dùng.
+ * Không chứa logic mạng.
  *
  * Luồng hoạt động:
  *   - Thao tác của người dùng (đăng nhập, gửi tin, gửi/nhận file) -> gọi hàm trong `Api` (api.js).
@@ -40,7 +41,7 @@ const FILE_TEXT = {
   transferring: "Transferring", verifying: "Verifying", completed: "Completed ✓",
   rejected: "Rejected", failed: "Failed", cancelled: "Cancelled",
 };
-const FILE_DONE = new Set(["completed", "rejected", "failed", "cancelled"]);
+const MAX_TEXT_BYTES = 250;      // protocol-spec 13.1: the agent request must stay under ~350 bytes
 const AUTH_TIMEOUT_MS = 10000; // server closes unauthenticated connections after 10 s (spec 7)
 
 const S = {
@@ -50,7 +51,6 @@ const S = {
   users: new Map(),     // online usernames -> {ip, port}
   convs: new Map(),     // "*" or username -> [{sender, text, ts}]
   transfers: new Map(), // key -> transfer
-  net: {},
   active: "*",
   authTimer: null,
 };
@@ -61,8 +61,7 @@ const $ = (id) => document.getElementById(id);
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(props || {})) {
-    if (k === "class") el.className = v;
-    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else if (v === true) el.setAttribute(k, "");
     else if (v !== false && v != null) el.setAttribute(k, v);
   }
@@ -70,7 +69,6 @@ function h(tag, props, ...kids) {
   return el;
 }
 
-const initials = (name) => (name || "?").slice(0, 2).toUpperCase();
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 function fmtBytes(n) {
   if (n < 1024) return n + " B";
@@ -84,7 +82,7 @@ const errText = (code, fallback) => ERROR_TEXT[code] || fallback || code || "Unk
 /* Toasts, banner, views                                              */
 /* ------------------------------------------------------------------ */
 function toast(text, info) {
-  const el = h("div", { class: "toast" + (info ? " info" : ""), role: "alert" }, text);
+  const el = h("p", { role: "alert" }, (info ? "Info: " : "Error: ") + text);
   $("toasts").append(el);
   setTimeout(() => el.remove(), 5000);
 }
@@ -98,12 +96,10 @@ function renderBanner() {
   const b = $("banner");
   b.replaceChildren();
   if (!S.link) {
-    b.className = "banner bad";
     b.append("Cannot reach the local agent (127.0.0.1) — retrying…");
     b.hidden = false;
   } else if (S.me && S.conn === "disconnected") {
-    b.className = "banner";
-    b.append("Lost connection to the server.", h("button", { class: "btn ghost sm", type: "button", onclick: backToLogin }, "Back to login"));
+    b.append("Lost connection to the server.", h("button", { type: "button", onclick: backToLogin }, "Back to login"));
     b.hidden = false;
   } else {
     b.hidden = true;
@@ -115,7 +111,6 @@ function backToLogin() {
   S.users.clear();
   S.convs.clear();
   S.transfers.clear();
-  S.net = {};
   S.active = "*";
   setLoginBusy(false);
   showView(false);
@@ -183,19 +178,17 @@ function selectConv(key) {
   $("text-input").focus();
 }
 
-function convButton(key, avatar, label) {
+function convButton(key, label) {
+  const selected = key === S.active; // no CSS, so mark the open conversation with text
   return h("li", {}, h("button", {
-    type: "button", class: key === S.active ? "act" : "", onclick: () => selectConv(key),
-    "aria-current": key === S.active ? "true" : false,
-  }, h("span", { class: "av" }, avatar), h("span", { class: "name" }, label),
-  key !== "*" ? h("span", { class: "dot", title: "online" }) : null));
+    type: "button", onclick: () => selectConv(key), "aria-current": selected ? "true" : false,
+  }, (selected ? "> " : "") + label));
 }
 
 function renderSidebar() {
-  $("channel-list").replaceChildren(convButton("*", "#", "Global chat"));
+  $("channel-list").replaceChildren(convButton("*", "Global chat"));
   const names = [...S.users.keys()].filter((n) => n !== S.me).sort((a, b) => a.localeCompare(b));
-  $("user-list").replaceChildren(...names.map((n) => convButton(n, initials(n), n)));
-  $("self-avatar").textContent = initials(S.me);
+  $("user-list").replaceChildren(...names.map((n) => convButton(n, n)));
   $("self-name").textContent = S.me || "";
 }
 
@@ -204,7 +197,6 @@ function renderHeader() {
   $("conv-title").textContent = priv ? "@ " + S.active : "# Global chat";
   const connected = S.conn === "authenticated" && S.link;
   $("pill-conn").textContent = (connected ? "● " : "○ ") + (CONN_TEXT[S.conn] || S.conn);
-  $("pill-conn").className = "pill " + (connected ? "ok" : "bad");
   $("text-input").disabled = !connected;
   $("send-btn").disabled = !connected;
   $("attach-btn").disabled = !connected || !priv;
@@ -212,19 +204,10 @@ function renderHeader() {
 }
 
 function renderMessages() {
-  const box = $("messages");
   const items = convItems(S.active);
-  const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60 || !box.children.length;
-  if (!items.length) {
-    box.replaceChildren(h("div", { class: "empty" }, "No messages yet."));
-    return;
-  }
-  box.replaceChildren(...items.map((it) => {
-    const mine = it.sender === S.me;
-    return h("div", { class: "m" + (mine ? " mine" : "") }, h("div", { class: "av" }, initials(it.sender)),
-      h("div", {}, h("div", { class: "meta" }, it.sender + " · " + fmtTime(it.ts)), h("div", { class: "bubble" }, it.text)));
-  }));
-  if (stick) box.scrollTop = box.scrollHeight;
+  $("messages").replaceChildren(...(items.length
+    ? items.map((it) => h("p", {}, h("b", {}, it.sender), " (" + fmtTime(it.ts) + "): " + it.text))
+    : [h("p", {}, "No messages yet.")]));
 }
 
 function addMessage(key, msg) {
@@ -240,6 +223,9 @@ $("composer").addEventListener("submit", async (e) => {
   const input = $("text-input");
   const text = input.value.trim();
   if (!text) return;
+  if (new TextEncoder().encode(text).length > MAX_TEXT_BYTES) {
+    return toast("Message too long (max " + MAX_TEXT_BYTES + " bytes; accented characters use 2-3 bytes each)");
+  }
   input.value = "";
   const target = S.active;
   try {
@@ -251,17 +237,15 @@ $("composer").addEventListener("submit", async (e) => {
   }
 });
 
-$("attach-btn").addEventListener("click", () => $("file-input").click());
-$("file-input").addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  e.target.value = "";
-  if (!file) return;
+// The agent opens the native file dialog itself, so the browser never handles the file bytes.
+$("attach-btn").addEventListener("click", async () => {
   const target = S.active;
   try {
-    const res = await Api.offerFile(target, file);
+    const res = await Api.offerFile(target);
     if (!res.ok) return toast(errText(res.code, res.message));
+    if (!res.ref) return; // dialog closed without choosing a file
     if (!findTransfer({ ref: res.ref })) { // the agent's first "file" event may already have created it
-      upsertTransfer({ key: res.ref, ref: res.ref, direction: "send", peer: target, filename: file.name, size_bytes: file.size, state: "offered" });
+      upsertTransfer({ key: res.ref, ref: res.ref, direction: "send", peer: target, filename: res.filename, size_bytes: res.size_bytes, state: "offered" });
       renderTransfers();
     }
   } catch (err) {
@@ -290,21 +274,15 @@ function upsertTransfer(data) {
 }
 
 function fileCard(t) {
-  const done = FILE_DONE.has(t.state);
   const pct = t.size_bytes ? Math.min(100, Math.floor((t.transferred_bytes / t.size_bytes) * 100)) : 0;
-  const bad = t.state === "failed" || t.state === "rejected" || t.state === "cancelled";
-  const barCls = t.state === "completed" ? "done" : bad ? "fail" : "";
-  const stCls = t.state === "completed" ? "st-ok" : bad ? "st-bad" : "st-wait";
-  const arrow = (t.direction === "send" ? "↑ " : "↓ ") + t.peer;
-  return h("div", { class: "card", "data-file": t.key },
-    h("div", { class: "fname" }, t.filename),
-    h("div", { class: "frow" }, h("span", {}, fmtBytes(t.size_bytes) + " · " + arrow), h("span", {}, t.state === "transferring" ? pct + "%" : "")),
-    h("div", { class: "bar " + barCls, role: "progressbar", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100 },
-      h("i", { style: "width:" + (t.state === "completed" ? 100 : pct) + "%" })),
-    h("div", { class: "frow" }, h("span", { class: stCls }, FILE_TEXT[t.state] || t.state)),
-    t.state === "incoming" ? h("div", { class: "fact" },
-      h("button", { class: "btn sm", type: "button", onclick: () => respond(t, true) }, "Accept"),
-      h("button", { class: "btn ghost sm", type: "button", onclick: () => respond(t, false) }, "Reject")) : null);
+  const arrow = (t.direction === "send" ? "to " : "from ") + t.peer;
+  return h("li", { "data-file": t.key },
+    h("b", {}, t.filename), " (" + fmtBytes(t.size_bytes) + ", " + arrow + ")", h("br"),
+    h("progress", { max: 100, value: t.state === "completed" ? 100 : pct }), " " + (t.state === "transferring" ? pct + "%" : ""), h("br"),
+    FILE_TEXT[t.state] || t.state,
+    t.state === "incoming" ? [" ",
+      h("button", { type: "button", onclick: () => respond(t, true) }, "Accept"),
+      h("button", { type: "button", onclick: () => respond(t, false) }, "Reject")] : null);
 }
 
 function patchTransfer(t) {
@@ -315,7 +293,7 @@ function patchTransfer(t) {
 
 function renderTransfers() {
   const list = [...S.transfers.values()].reverse();
-  $("transfer-list").replaceChildren(...(list.length ? list.map(fileCard) : [h("div", { class: "small" }, "No files yet.")]));
+  $("transfer-list").replaceChildren(...(list.length ? list.map(fileCard) : [h("li", {}, "No files yet.")]));
 }
 
 async function respond(t, accepted) {
@@ -330,19 +308,6 @@ async function respond(t, accepted) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Network status card                                                */
-/* ------------------------------------------------------------------ */
-function renderNet() {
-  const n = S.net;
-  const row = (k, v) => h("div", { class: "row" }, h("span", {}, k), h("span", {}, v));
-  $("net-card").replaceChildren(
-    row("State", CONN_TEXT[S.conn] || S.conn),
-    row("RTT", n.rtt_ms != null ? Math.round(n.rtt_ms) + " ms" : "—"),
-    row("Packet loss", n.loss != null ? (n.loss * 100).toFixed(1) + "%" : "—"),
-  );
-}
-
-/* ------------------------------------------------------------------ */
 /* Events from the agent                                              */
 /* ------------------------------------------------------------------ */
 function handleEvent(ev) {
@@ -350,9 +315,6 @@ function handleEvent(ev) {
     case "conn":
       S.conn = ev.state;
       if (ev.state === "disconnected" && !S.me) setLoginBusy(false);
-      break;
-    case "net":
-      Object.assign(S.net, ev);
       break;
     case "auth_ack":
       setLoginBusy(false);
@@ -399,7 +361,6 @@ function handleEvents(events) {
   if (S.me) {
     renderSidebar();
     renderHeader();
-    renderNet();
   }
 }
 
@@ -407,7 +368,6 @@ function handleEvents(events) {
 /* Start                                                              */
 /* ------------------------------------------------------------------ */
 if (MOCK) $("login-hint").textContent = "Mock mode — not connected to a real agent.";
-renderNet();
 renderTransfers();
 Api.startEvents(handleEvents, (up) => {
   if (S.link === up) return;

@@ -4,71 +4,52 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CollabNet</title>
-  <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <!--
-    index.html — KHUNG TRANG (chỉ có cấu trúc, không có dữ liệu hay logic): màn hình đăng nhập
-    và màn hình chính (danh sách online, khung chat, trạng thái mạng, tiến độ truyền file).
-    Dữ liệu do app.js điền vào từ các sự kiện của agent; style.css lo phần giao diện.
+    index.html — KHUNG TRANG thuần HTML, không có CSS (chỉ có cấu trúc, không có dữ liệu hay logic):
+    màn hình đăng nhập và màn hình chính (danh sách online, khung chat, trạng thái mạng, tiến độ
+    truyền file). Dữ liệu do app.js điền vào từ các sự kiện của agent.
     Đang chạy dữ liệu giả (mock)? Cách tắt mock nằm ở đầu file api.js (đổi USE_MOCK = false).
   -->
-  <div id="banner" class="banner" hidden role="status"></div>
+  <div id="banner" role="status" hidden></div>
+  <div id="toasts" aria-live="assertive"></div>
 
-  <main id="login-view" class="center">
-    <form id="login-form" class="login" autocomplete="off">
-      <h1>Collab<span>Net</span></h1>
-      <label class="field">Username
-        <input id="login-user" required maxlength="32" autofocus>
-      </label>
-      <label class="field">Password
-        <input id="login-pass" type="password" required>
-      </label>
-      <p id="login-error" class="form-error" role="alert" hidden></p>
-      <button id="login-btn" class="btn" type="submit">Log in</button>
-      <p id="login-hint" class="hint"></p>
+  <div id="login-view">
+    <h1>CollabNet</h1>
+    <form id="login-form" autocomplete="off">
+      <p><label>Username: <input id="login-user" required maxlength="32" autofocus></label></p>
+      <p><label>Password: <input id="login-pass" type="password" required></label></p>
+      <p id="login-error" role="alert" hidden></p>
+      <p><button id="login-btn" type="submit">Log in</button></p>
+      <p id="login-hint"></p>
     </form>
-  </main>
-
-  <div id="app-view" class="app" hidden>
-    <aside class="side" aria-label="Online users">
-      <div class="brand">Collab<b>Net</b></div>
-      <nav>
-        <ul id="channel-list" class="list"></ul>
-        <div class="sec">Online</div>
-        <ul id="user-list" class="list"></ul>
-      </nav>
-      <div class="self">
-        <div id="self-avatar" class="av"></div>
-        <div class="grow" id="self-name"></div>
-        <button id="logout-btn" class="btn ghost sm" type="button">Log out</button>
-      </div>
-    </aside>
-
-    <section class="main" aria-label="Conversation">
-      <header class="top">
-        <h2 id="conv-title"></h2>
-        <span class="grow"></span>
-        <span id="pill-conn" class="pill"></span>
-      </header>
-      <div id="messages" class="msgs" aria-live="polite"></div>
-      <form id="composer" class="inp" autocomplete="off">
-        <input id="file-input" type="file" hidden>
-        <button id="attach-btn" class="btn ghost" type="button" aria-label="Send file">Attach</button>
-        <input id="text-input" placeholder="Type a message…" maxlength="2000" aria-label="Message">
-        <button id="send-btn" class="btn" type="submit">Send</button>
-      </form>
-    </section>
-
-    <aside class="right" aria-label="Network status and file transfers">
-      <div class="sec first">Network status</div>
-      <div class="card" id="net-card"></div>
-      <div class="sec">File transfers</div>
-      <div id="transfer-list"></div>
-    </aside>
   </div>
 
-  <div id="toasts" class="toasts" aria-live="assertive"></div>
+  <div id="app-view" hidden>
+    <h1>CollabNet</h1>
+    <p>Logged in as <b id="self-name"></b> <button id="logout-btn" type="button">Log out</button></p>
+    <hr>
+
+    <h2>Chats</h2>
+    <ul id="channel-list"></ul>
+    <h3>Online users</h3>
+    <ul id="user-list"></ul>
+    <hr>
+
+    <h2 id="conv-title"></h2>
+    <p id="pill-conn"></p>
+    <div id="messages" aria-live="polite"></div>
+    <form id="composer" autocomplete="off">
+      <button id="attach-btn" type="button">Attach file</button>
+      <input id="text-input" placeholder="Type a message… (max 250 bytes)" maxlength="250" size="50" aria-label="Message">
+      <button id="send-btn" type="submit">Send</button>
+    </form>
+    <hr>
+
+    <h2>File transfers</h2>
+    <ul id="transfer-list"></ul>
+  </div>
 
   <script src="api.js"></script>
   <script src="app.js"></script>
