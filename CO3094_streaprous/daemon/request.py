@@ -113,7 +113,7 @@ class Request():
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
         #
-        # TODO:  Parse headers and body 
+        # TODO(DONE):  Parse headers and body 
         # with self.fetch_headers_body(request)
         # and self.prepare_headers(self._raw_headers)
         #
@@ -127,7 +127,7 @@ class Request():
         # @bksysnet Preapring the webapp hook with StreapRous instance
         # The default behaviour with HTTP server is empty routed
         #
-        # TODO manage the webapp hook in this mounting point
+        # TODO(DONE) manage the webapp hook in this mounting point
         #
         
         if routes:
@@ -135,8 +135,16 @@ class Request():
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
             self.hook = routes.get((self.method, self.path))
             print("[Request] Hook has request {}".format(request))
+            #
+            # self.hook manipulation goes here
+            # ...
+            #
 
         cookies = self.headers.get('cookie', '')
+            #
+            #  TODO (DONE): implement the cookie function here
+            #        by parsing the header            #
+
         self.cookies = {}
         if cookies:
             for pair in cookies.split(';'):

@@ -350,6 +350,9 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
 
     """
 
+    # TODO: Hardcode for fast data pushing
+    #       The setting PSH + ACK
+    #       need to modify in full schema
     flags = 0x18
     offset_res = (5 << 4) + 0
     window = max(0, min(65535, int(window)))

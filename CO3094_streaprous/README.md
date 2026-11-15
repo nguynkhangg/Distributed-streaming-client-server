@@ -45,6 +45,41 @@ from daemon.streaprous import StreapRous
 app.prepare_address(ip, port)
 app.run()
 ```
+
+## Python chat
+
+Each peer registers its ID, username, advertised IP, and port with the tracker,
+then polls `POST /api/messages/poll` for queued events.
+Broadcast and private messages are delivered from in-memory queues by REST responses.
+
+StreapRous' raw-socket HTTP adapter receives each request with
+`run_conn_recv()` and sends its response with `run_conn_send()`; chat event
+delivery uses ordinary REST request/response cycles. Use a polling interval
+of at least six seconds because the existing raw HTTP adapter holds a
+completed connection for five seconds before closing it.
+
+Run a Python chat client in another terminal:
+
+```bash
+python client.py --server-host 192.168.56.10 --server-port 2026 --peer-id peer-1 --username Alice --advertised-ip 192.168.56.20
+```
+
+The client registers, joins `general`, and polls for events. Type a message to
+broadcast it to `general`, or `/quit` to exit. The client does not create a
+`StreapRous` server: `StreapRous.run()` starts a listener, whereas this client
+connects to the already-running server.
+
+The endpoints are `GET /api/peers`, `POST /api/peers/register`,
+`POST /api/peers/unregister`,
+`GET /api/channels`, `POST /api/channels/create`, `POST /api/channels/join`,
+`GET /api/messages`, `POST /api/messages` (channel broadcast),
+`POST /api/messages/direct` (private delivery), and
+`POST /api/messages/poll` (queued events). Messages are immutable and limited
+to 600 UTF-8 bytes. `client.py` provides Python methods for the REST
+endpoints and event polling. The registered peer IP/port are tracker metadata
+in this relay design; peers do not connect to those advertised addresses
+directly.
+
 ## License
 
 See [LICENSE](LICENSE) — educational use only for CO3093/CO3094.

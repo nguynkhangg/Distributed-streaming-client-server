@@ -169,6 +169,18 @@ class Response():
             base_dir = BASE_DIR+"static/"
             self.headers['Content-Type']='image/{}'.format(sub_type)
         elif main_type == 'application':
+        #
+        #  TODO (DONE): process other mime_type
+        #        application/xml       
+        #        application/zip
+        #        ...
+        #        text/csv
+        #        text/xml
+        #        ...
+        #        video/mp4 
+        #        video/mpeg
+        #        ...
+        #
             if sub_type in ('javascript', 'x-javascript'):
                 base_dir = BASE_DIR+"static/"
             else:
@@ -285,6 +297,9 @@ class Response():
             base_dir = self.prepare_content_type(mime_type = 'text/html')
         elif mime_type == 'text/css':
             base_dir = self.prepare_content_type(mime_type = 'text/css')
+        #
+        # TODO (DONE): add support objects
+        #
         elif mime_type in ('application/javascript', 'text/javascript', 'application/x-javascript'):
             base_dir = self.prepare_content_type(mime_type = mime_type)
         elif mime_type.startswith('image/'):
