@@ -18,22 +18,6 @@ class PacketType(IntEnum):
     PONG = 0x06
     CLOSE = 0x07
 
-    # Pending: needs recheck packet type values
-    AUTH = 0x03
-    AUTH_ACK = 0x04
-    LOGOUT = 0x05
-    LOGOUT_ACK = 0x06
-    HEARTBEAT = 0x08
-    MSG_OFFER = 0x0A
-    MSG = 0x0B
-    MSG_ACK = 0x0C
-    FILE_OFFER = 0x14
-    FILE_ACK = 0x15
-    FILE_DATA = 0x16
-    FILE_FIN = 0x17
-    ONLINE_LIST = 0x20
-    ERROR = 0xFF
-
 
 PACKET_TYPE_NAME = {
     0x01: "HELLO", 0x02: "HELLO_ACK", 0x03: "AUTH", 0x04: "AUTH_ACK",
