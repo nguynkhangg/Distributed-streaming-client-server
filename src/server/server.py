@@ -8,6 +8,7 @@ import itertools
 import json
 import logging
 import os
+import queue
 import socket
 import struct
 import threading
@@ -15,6 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
+from functools import partial
 
 try:
     from .auth import UsersFileError, UserStore
@@ -26,6 +28,7 @@ try:
         BindResult,
         ClientSession,
         CloseReason,
+        PacketNumberExhausted,
         RemoveResult,
         SessionLimitError,
         SessionManager,
@@ -41,6 +44,7 @@ except ImportError:
         BindResult,
         ClientSession,
         CloseReason,
+        PacketNumberExhausted,
         RemoveResult,
         SessionLimitError,
         SessionManager,
@@ -48,33 +52,28 @@ except ImportError:
     )
 
 try:
-    from ..security.concurrency import shutdown_workers, submit_datagram
     from ..security.encryption import (
         DIR_C2S,
         DIR_S2C,
         GCM_TAG_SIZE,
         CryptoError,
-        derive_keys,
-        derive_session_keys,
         open as gcm_open,
         seal,
-        x25519_shared_secret,
     )
 except ImportError:
-    from src.security.concurrency import shutdown_workers, submit_datagram
     from src.security.encryption import (
         DIR_C2S,
         DIR_S2C,
         GCM_TAG_SIZE,
         CryptoError,
-        derive_keys,
-        derive_session_keys,
         open as gcm_open,
         seal,
-        x25519_shared_secret,
     )
 
 log = logging.getLogger("ccp.server")
+
+WORKERS = 16
+QUEUE_PER_WORKER = 64
 
 MAGIC = 0xA5C3
 VERSION = 1
@@ -241,6 +240,16 @@ class CcpServer:
             "LOGOUT": self._handle_logout,
         }
         self._stop = threading.Event()
+        self._queues = [queue.Queue(QUEUE_PER_WORKER) for _ in range(WORKERS)]
+        self._workers = [
+            threading.Thread(
+                target=self._worker,
+                args=(q,),
+                daemon=True,
+                name=f"ccp-worker-{i}",
+            )
+            for i, q in enumerate(self._queues)
+        ]
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self._sock.bind((host, port))
@@ -269,6 +278,8 @@ class CcpServer:
 
     def serve_forever(self) -> None:
         threading.Thread(target=self._sweep_loop, name="sweeper", daemon=True).start()
+        for worker in self._workers:
+            worker.start()
         while not self._stop.is_set():
             try:
                 data, addr = self._sock.recvfrom(RECV_BUFFER)
@@ -282,21 +293,35 @@ class CcpServer:
                 log.error("recvfrom failed: %s", exc)
                 time.sleep(0.1)
                 continue
-            submit_datagram(self._handle_datagram_safe, data, addr)
+            # Same connection -> same worker. HELLO (cid 0) shards by address.
+            cid = int.from_bytes(data[6:10], "big") if len(data) >= 10 else 0
+            shard = cid % WORKERS if cid else hash(addr) % WORKERS
+            try:
+                self._queues[shard].put_nowait((data, addr))
+            except queue.Full:
+                log.warning("worker %d busy, dropping datagram from %s", shard, addr)
 
-    def _handle_datagram_safe(self, data: bytes, addr: Address) -> None:
-        try:
-            self._handle_datagram(data, addr)
-        except Exception:
-            log.exception("error while handling datagram from %s", addr)
+    def _worker(self, inbox: queue.Queue) -> None:
+        while not self._stop.is_set():
+            try:
+                data, addr = inbox.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._handle_datagram(data, addr)
+            except Exception:
+                log.exception("error while handling datagram from %s", addr)
 
     def shutdown(self) -> None:
-        """Stop background threads, notify active sessions with CLOSE, and release socket."""
+        """Stop workers, ENC CLOSE while keys live, then clear sessions."""
         self._stop.set()
-        for result in self._sessions.remove_all():
-            self._send_close(result.session, CloseReason.SERVER_SHUTDOWN)
-        shutdown_workers(wait=False)
+        for session in self._sessions.all_sessions():
+            self._send_close(session, CloseReason.SERVER_SHUTDOWN)
+        self._sessions.remove_all()
         self._sock.close()
+        for worker in self._workers:
+            if worker.is_alive():
+                worker.join(timeout=1)
 
     def _sweep_loop(self) -> None:
         while not self._stop.wait(SWEEP_INTERVAL):
@@ -312,6 +337,19 @@ class CcpServer:
         for session in self._sessions.find_idle(now):
             self._send(session, PacketType.PING)
 
+    def _run_pending(self, session: ClientSession) -> None:
+        """Drain session.pending with single-owner semantics (no overlapping handlers)."""
+        while True:
+            with session.lock:
+                if not session.pending:
+                    session._drain_active = False
+                    return
+                action = session.pending.popleft()
+            try:
+                action()
+            except Exception:
+                log.exception("handler error for %s", session.address)
+
     # ---- packet-layer dispatch ----------------------------------------
 
     def _handle_datagram(self, data: bytes, addr: Address) -> None:
@@ -325,104 +363,49 @@ class CcpServer:
             return
 
         session = self._sessions.lookup(header.connection_id, addr)
-        if session is None:
-            log.debug(
-                "drop %s from %s: unknown connection_id/address",
-                header.packet_type.name,
-                addr,
-            )
-            return
-
-        if header.flags & FLAG_ENC:
-            if session.key_c2s is None:
-                log.debug(
-                    "drop %s from %s: ENC before keys ready",
-                    header.packet_type.name,
-                    addr,
-                )
-                return
-            try:
-                payload = gcm_open(
-                    session.key_c2s,
-                    header.packet_number,
-                    data[:HEADER_SIZE],
-                    payload,
-                    direction=DIR_C2S,
-                )
-            except CryptoError:
-                log.debug(
-                    "drop %s from %s: GCM auth failed",
-                    header.packet_type.name,
-                    addr,
-                )
-                return
-            session.use_encryption = True
-        else:
-            session.use_encryption = False
-
         handler = self._handlers.get(header.packet_type)
-        if handler is None:
-            log.debug(
-                "drop %s from %s: not valid client-to-server",
-                header.packet_type.name,
-                addr,
-            )
+        if session is None or handler is None:
+            log.debug("drop %s from %s: unknown session or type", header.packet_type.name, addr)
             return
-        session.touch()
-        handler(session, payload)
+
+        with session.lock:
+            if session.closed:
+                return
+            if header.flags & FLAG_ENC:
+                if session.key_c2s is None:
+                    return
+                try:
+                    payload = gcm_open(
+                        session.key_c2s, header.packet_number, data[:HEADER_SIZE],
+                        payload, direction=DIR_C2S,
+                    )
+                except CryptoError:
+                    return
+            session.touch()
+            session.pending.append(partial(handler, session, payload))
+            if session._drain_active:
+                return
+            session._drain_active = True
+        self._run_pending(session)
 
     def _on_hello(self, header: PacketHeader, payload: bytes, addr: Address) -> None:
-        if header.connection_id != 0:
-            log.debug("drop HELLO from %s: connection_id must be 0", addr)
+        if header.connection_id != 0 or len(payload) != KEY_SIZE + NONCE_SIZE:
+            log.debug("drop bad HELLO from %s", addr)
             return
-        if not payload:
-            client_key, client_nonce = bytes(KEY_SIZE), bytes(NONCE_SIZE)
-        elif len(payload) == KEY_SIZE + NONCE_SIZE:
-            client_key, client_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
-        else:
-            log.debug(
-                "drop HELLO from %s: payload must be 0 or %d bytes",
-                addr,
-                KEY_SIZE + NONCE_SIZE,
-            )
-            return
-
         try:
-            result = self._sessions.get_or_create_session(addr, client_key, client_nonce)
-        except SessionLimitError:
-            log.warning("session table full, drop HELLO from %s", addr)
+            result = self._sessions.get_or_create_session(
+                addr, payload[:KEY_SIZE], payload[KEY_SIZE:],
+            )
+        except (SessionLimitError, CryptoError) as exc:
+            log.warning("drop HELLO from %s: %s", addr, exc)
             return
-
         if result.replaced is not None:
             self._handle_removed(result.replaced, "client restarted")
-
-        session = result.session
         if result.is_new:
-            if (
-                session.server_private_key is not None
-                and session.client_public_key != bytes(KEY_SIZE)
-            ):
-                shared = x25519_shared_secret(
-                    session.server_private_key, session.client_public_key
-                )
-                session.key_c2s, session.key_s2c = derive_session_keys(
-                    shared, session.client_nonce, session.server_nonce
-                )
-            else:
-                session.key_c2s, session.key_s2c = derive_keys(
-                    session.client_public_key,
-                    session.server_public_key,
-                    session.client_nonce,
-                    session.server_nonce,
-                )
-            log.info("new session %08x for %s:%d", session.connection_id, *addr)
-        else:
-            log.debug("HELLO retransmission from %s: resend HELLO_ACK", addr)
-
+            log.info("new session %08x for %s:%d", result.session.connection_id, *addr)
         self._send(
-            session,
-            PacketType.HELLO_ACK,
-            session.server_public_key + session.server_nonce,
+            result.session, PacketType.HELLO_ACK,
+            result.session.server_public_key + result.session.server_nonce,
         )
 
     def _on_ping(self, session: ClientSession, payload: bytes) -> None:
@@ -488,11 +471,12 @@ class CcpServer:
                 )
 
     def _close_session(self, session: ClientSession, reason: CloseReason, why: str) -> None:
-        result = self._sessions.remove_session(session.connection_id)
-        if result is None:
+        if session.closed:
             return
-        self._send_close(session, reason)
-        self._handle_removed(result, why)
+        self._send_close(session, reason)  # ENC CLOSE while keys live
+        result = self._sessions.remove_session(session.connection_id)
+        if result is not None:
+            self._handle_removed(result, why)
 
     # ---- control & chat message layer ---------------------------------
 
@@ -724,6 +708,7 @@ class CcpServer:
             )
 
     def _fan_out(self, recipients: list[ClientSession], msg_type: str, payload: dict) -> None:
+        # Take at most one peer.lock at a time (no nested A↔B waits).
         for peer in recipients:
             try:
                 self._send_message(peer, msg_type, payload)
@@ -759,13 +744,20 @@ class CcpServer:
             "version": PROTOCOL_VERSION,
         }
         body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self._send_frame(session, STREAM_OF[msg_type], struct.pack("!I", len(body)) + body)
+        with session.lock:
+            if session.closed or session.key_s2c is None:
+                return
+            self._send_frame(
+                session, STREAM_OF[msg_type], struct.pack("!I", len(body)) + body
+            )
 
     def _send_frame(self, session: ClientSession, stream_id: int, frame: bytes) -> None:
         offset = session.stream_offsets.get(stream_id, 0)
         session.stream_offsets[stream_id] = offset + len(frame)
-        stream_header = struct.pack(STREAM_HEADER_FORMAT, stream_id, offset)
-        self._send(session, PacketType.DATA, stream_header + frame)
+        self._send(
+            session, PacketType.DATA,
+            struct.pack(STREAM_HEADER_FORMAT, stream_id, offset) + frame,
+        )
 
     def _send(
         self,
@@ -773,29 +765,22 @@ class CcpServer:
         packet_type: PacketType,
         payload: bytes = b"",
     ) -> None:
-        pn = session.allocate_packet_number()
-        use_enc = (
-            session.use_encryption
-            and session.key_s2c is not None
-            and packet_type not in (PacketType.HELLO, PacketType.HELLO_ACK)
-        )
-        if use_enc:
+        try:
+            pn = session.allocate_packet_number()
+        except PacketNumberExhausted:
+            log.error("packet numbers exhausted for %08x", session.connection_id)
+            return
+        if packet_type is PacketType.HELLO_ACK or session.key_s2c is None:
+            raw = pack_packet(packet_type, session.connection_id, pn, payload, 0)
+        else:
             sealed_len = len(payload) + GCM_TAG_SIZE
             header16 = struct.pack(
-                HEADER_FORMAT,
-                MAGIC,
-                VERSION,
-                int(packet_type),
-                FLAG_ENC,
-                0,
-                session.connection_id,
-                pn,
-                sealed_len,
+                HEADER_FORMAT, MAGIC, VERSION, int(packet_type), FLAG_ENC, 0,
+                session.connection_id, pn, sealed_len,
             )
-            body = seal(session.key_s2c, pn, header16, payload, direction=DIR_S2C)
-            raw = header16 + body
-        else:
-            raw = pack_packet(packet_type, session.connection_id, pn, payload, 0)
+            raw = header16 + seal(
+                session.key_s2c, pn, header16, payload, direction=DIR_S2C
+            )
         try:
             self._sock.sendto(raw, session.address)
         except OSError as exc:
