@@ -25,6 +25,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.server.auth import RegisterResult, UserStore, make_record, verify_password  # noqa: E402
+from src.security.encryption import new_keypair  # noqa: E402
 from src.server.server import CcpServer, PacketType, pack_packet  # noqa: E402
 from src.server.session_manager import MAX_AUTH_FAILURES, CloseReason, SessionState  # noqa: E402
 
@@ -104,8 +105,9 @@ class ServerTestCase(unittest.TestCase):
     # ---- helpers ----
     def connect(self):
         self._port += 1
+        _priv, pub = new_keypair()
         return self.server._sessions.get_or_create_session(
-            ("10.0.0.1", self._port), bytes(32), secrets.token_bytes(16)).session
+            ("10.0.0.1", self._port), pub, secrets.token_bytes(16)).session
 
     def send(self, session, msg_type, payload=None, **kwargs):
         self.server._dispatch_control_json(session, frame(msg_type, payload, **kwargs))
@@ -363,7 +365,9 @@ class TestLogoutAndPresence(ServerTestCase):
     def test_client_restart_announces_offline_for_the_old_session(self):
         alice, bob = self.login("alice"), self.login("bob")
         self.clear()
-        hello = pack_packet(PacketType.HELLO, 0, 1, b"")         # same (ip, port), different nonce
+        _priv, pub = new_keypair()
+        # Same (ip, port), different nonce → replace old session.
+        hello = pack_packet(PacketType.HELLO, 0, 1, pub + secrets.token_bytes(16))
         self.server._handle_datagram(hello, alice.address)
         self.assertIs(alice.state, SessionState.CLOSED)
         self.assertEqual([m["payload"] for m in self.inbox(bob, "PRESENCE")],
