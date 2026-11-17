@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import secrets
 import socket
 import struct
 import threading
@@ -10,6 +11,7 @@ import time
 import unittest
 
 from src.client.network import CcpClient, ConnectionState
+from src.security.encryption import KEY_SIZE, generate_x25519_keypair
 from src.server.server import CcpServer
 
 
@@ -21,6 +23,7 @@ HELLO_ACK = 0x02
 PING = 0x05
 PONG = 0x06
 CLOSE = 0x07
+NONCE_SIZE = 16
 
 
 def build_packet(packet_type, connection_id, packet_number, payload=b""):
@@ -28,6 +31,11 @@ def build_packet(packet_type, connection_id, packet_number, payload=b""):
         MAGIC, VERSION, packet_type, 0, 0, connection_id, packet_number,
         len(payload),
     ) + payload
+
+
+def hello_payload(nonce: bytes | None = None) -> bytes:
+    _priv, pub = generate_x25519_keypair()
+    return pub + (nonce if nonce is not None else secrets.token_bytes(NONCE_SIZE))
 
 
 def parse_packet(data):
@@ -95,12 +103,14 @@ class HandshakeIntegrationTest(unittest.TestCase):
             )
 
         try:
-            send(HELLO, 0)
+            nonce = secrets.token_bytes(NONCE_SIZE)
+            hello = hello_payload(nonce)
+            send(HELLO, 0, hello)
             connection_id, payload = self.expect_packet(sock, HELLO_ACK)
             self.assertNotEqual(connection_id, 0)
-            self.assertEqual(len(payload), 48)
+            self.assertEqual(len(payload), KEY_SIZE + NONCE_SIZE)
 
-            send(HELLO, 0)
+            send(HELLO, 0, hello)  # same pubkey+nonce → retransmission
             retransmitted_id, _ = self.expect_packet(sock, HELLO_ACK)
             self.assertEqual(retransmitted_id, connection_id)
 

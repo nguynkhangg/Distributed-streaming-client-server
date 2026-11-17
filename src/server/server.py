@@ -8,6 +8,7 @@ import itertools
 import json
 import logging
 import os
+import queue
 import socket
 import struct
 import threading
@@ -16,63 +17,29 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 
-try:
-    from .auth import UsersFileError, UserStore
-    from .session_manager import (
-        KEY_SIZE,
-        MAX_AUTH_FAILURES,
-        NONCE_SIZE,
-        Address,
-        BindResult,
-        ClientSession,
-        CloseReason,
-        RemoveResult,
-        SessionLimitError,
-        SessionManager,
-        SessionState,
-    )
-except ImportError:
-    from auth import UsersFileError, UserStore
-    from session_manager import (
-        KEY_SIZE,
-        MAX_AUTH_FAILURES,
-        NONCE_SIZE,
-        Address,
-        BindResult,
-        ClientSession,
-        CloseReason,
-        RemoveResult,
-        SessionLimitError,
-        SessionManager,
-        SessionState,
-    )
-
-try:
-    from ..security.concurrency import shutdown_workers, submit_datagram
-    from ..security.encryption import (
-        DIR_C2S,
-        DIR_S2C,
-        GCM_TAG_SIZE,
-        CryptoError,
-        derive_keys,
-        derive_session_keys,
-        open as gcm_open,
-        seal,
-        x25519_shared_secret,
-    )
-except ImportError:
-    from src.security.concurrency import shutdown_workers, submit_datagram
-    from src.security.encryption import (
-        DIR_C2S,
-        DIR_S2C,
-        GCM_TAG_SIZE,
-        CryptoError,
-        derive_keys,
-        derive_session_keys,
-        open as gcm_open,
-        seal,
-        x25519_shared_secret,
-    )
+from .auth import UsersFileError, UserStore
+from .session_manager import (
+    KEY_SIZE,
+    MAX_AUTH_FAILURES,
+    NONCE_SIZE,
+    Address,
+    BindResult,
+    ClientSession,
+    CloseReason,
+    RemoveResult,
+    SessionLimitError,
+    SessionManager,
+    SessionState,
+)
+from ..security.encryption import (
+    DIR_C2S,
+    DIR_S2C,
+    GCM_TAG_SIZE,
+    CryptoError,
+    derive_keys,
+    open as gcm_open,
+    seal,
+)
 
 log = logging.getLogger("ccp.server")
 
@@ -88,6 +55,8 @@ MAX_PAYLOAD = MAX_DATAGRAM - HEADER_SIZE                 # 1184 bytes
 FLAG_FIN = 0x01
 FLAG_ENC = 0x02
 
+WORKERS = 16
+QUEUE_PER_WORKER = 64
 
 class PacketType(IntEnum):
     HELLO = 0x01
@@ -241,6 +210,8 @@ class CcpServer:
             "LOGOUT": self._handle_logout,
         }
         self._stop = threading.Event()
+        self._queues = [queue.Queue(QUEUE_PER_WORKER) for _ in range(WORKERS)]
+        self._workers = [threading.Thread(target=self._worker, args=(q,), daemon=True, name=f"ccp-worker-{i}") for i, q in enumerate(self._queues)]
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self._sock.bind((host, port))
@@ -269,6 +240,8 @@ class CcpServer:
 
     def serve_forever(self) -> None:
         threading.Thread(target=self._sweep_loop, name="sweeper", daemon=True).start()
+        for worker in self._workers:
+            worker.start()
         while not self._stop.is_set():
             try:
                 data, addr = self._sock.recvfrom(RECV_BUFFER)
@@ -282,21 +255,34 @@ class CcpServer:
                 log.error("recvfrom failed: %s", exc)
                 time.sleep(0.1)
                 continue
-            submit_datagram(self._handle_datagram_safe, data, addr)
+            # Same connection → same worker. HELLO (cid 0) shards by address.
+            cid = int.from_bytes(data[6:10], "big") if len(data) >= 10 else 0
+            shard = cid % WORKERS if cid else hash(addr) % WORKERS
+            try:
+                self._queues[shard].put_nowait((data, addr))
+            except queue.Full:
+                log.warning("worker %d busy, dropping datagram from %s", shard, addr)
 
-    def _handle_datagram_safe(self, data: bytes, addr: Address) -> None:
-        try:
-            self._handle_datagram(data, addr)
-        except Exception:
-            log.exception("error while handling datagram from %s", addr)
+    def _worker(self, inbox: queue.Queue) -> None:
+        while not self._stop.is_set():
+            try:
+                data, addr = inbox.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._handle_datagram(data, addr)
+            except Exception:
+                log.exception("error while handling datagram from %s", addr)
 
     def shutdown(self) -> None:
-        """Stop background threads, notify active sessions with CLOSE, and release socket."""
+        """Stop workers, notify active sessions with CLOSE, and release socket."""
         self._stop.set()
         for result in self._sessions.remove_all():
             self._send_close(result.session, CloseReason.SERVER_SHUTDOWN)
-        shutdown_workers(wait=False)
         self._sock.close()
+        for worker in self._workers:
+            if worker.is_alive():
+                worker.join(timeout=1)
 
     def _sweep_loop(self) -> None:
         while not self._stop.wait(SWEEP_INTERVAL):
@@ -375,17 +361,14 @@ class CcpServer:
         if header.connection_id != 0:
             log.debug("drop HELLO from %s: connection_id must be 0", addr)
             return
-        if not payload:
-            client_key, client_nonce = bytes(KEY_SIZE), bytes(NONCE_SIZE)
-        elif len(payload) == KEY_SIZE + NONCE_SIZE:
-            client_key, client_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
-        else:
+        if len(payload) != KEY_SIZE + NONCE_SIZE:
             log.debug(
-                "drop HELLO from %s: payload must be 0 or %d bytes",
+                "drop HELLO from %s: payload must be %d bytes",
                 addr,
                 KEY_SIZE + NONCE_SIZE,
             )
             return
+        client_key, client_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
 
         try:
             result = self._sessions.get_or_create_session(addr, client_key, client_nonce)
@@ -398,23 +381,19 @@ class CcpServer:
 
         session = result.session
         if result.is_new:
-            if (
-                session.server_private_key is not None
-                and session.client_public_key != bytes(KEY_SIZE)
-            ):
-                shared = x25519_shared_secret(
-                    session.server_private_key, session.client_public_key
-                )
-                session.key_c2s, session.key_s2c = derive_session_keys(
-                    shared, session.client_nonce, session.server_nonce
-                )
-            else:
+            if session.server_private_key is None:
+                log.warning("drop HELLO from %s: missing server private key", addr)
+                return
+            try:
                 session.key_c2s, session.key_s2c = derive_keys(
+                    session.server_private_key,
                     session.client_public_key,
-                    session.server_public_key,
                     session.client_nonce,
                     session.server_nonce,
                 )
+            except CryptoError as exc:
+                log.debug("drop HELLO from %s: %s", addr, exc)
+                return
             log.info("new session %08x for %s:%d", session.connection_id, *addr)
         else:
             log.debug("HELLO retransmission from %s: resend HELLO_ACK", addr)

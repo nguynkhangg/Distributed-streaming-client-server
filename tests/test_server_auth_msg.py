@@ -363,7 +363,13 @@ class TestLogoutAndPresence(ServerTestCase):
     def test_client_restart_announces_offline_for_the_old_session(self):
         alice, bob = self.login("alice"), self.login("bob")
         self.clear()
-        hello = pack_packet(PacketType.HELLO, 0, 1, b"")         # same (ip, port), different nonce
+        # Restarted client at same address with a new ECDH HELLO (different nonce).
+        from src.security.encryption import generate_x25519_keypair
+
+        _priv, pub = generate_x25519_keypair()
+        hello = pack_packet(
+            PacketType.HELLO, 0, 1, pub + secrets.token_bytes(16)
+        )
         self.server._handle_datagram(hello, alice.address)
         self.assertIs(alice.state, SessionState.CLOSED)
         self.assertEqual([m["payload"] for m in self.inbox(bob, "PRESENCE")],
