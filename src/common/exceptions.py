@@ -14,3 +14,5 @@ class FileTransferError(CCPException):
     pass
 class EncryptionError(CCPException):
     pass
+class HandshakeTimeoutError(CCPException, TimeoutError):
+    pass

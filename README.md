@@ -104,6 +104,18 @@ Open another terminal for each client and run:
 
 TODO — add the exact client command and explain how to configure the server address/port.
 
+The current messaging CLI is available with:
+
+```bash
+python -m src.client.client --host 127.0.0.1 --port 9000
+```
+
+It prompts for a username and password. Use `/broadcast <message>` to message all
+other logged-in users, `/private <user[,user...]> <message>` to message one or
+more named users, `/users` to refresh the online list, and `/quit` to log out.
+Each private recipient is sent as an individual `MSG` addressed to that username.
+The username must already exist in the server's configured user store.
+
 ### Run tests
 
 TODO — add the unit-test and integration-test commands. Include a test with multiple client instances and file-transfer integrity verification.
