@@ -9,8 +9,7 @@
   <!--
     index.html — KHUNG TRANG thuần HTML, không có CSS (chỉ có cấu trúc, không có dữ liệu hay logic):
     màn hình đăng nhập và màn hình chính (danh sách online, khung chat, trạng thái mạng, tiến độ
-    truyền file). Dữ liệu do app.js điền vào từ các sự kiện của agent.
-    Đang chạy dữ liệu giả (mock)? Cách tắt mock nằm ở đầu file api.js (đổi USE_MOCK = false).
+    truyền file). Dữ liệu do app.js điền vào từ các sự kiện của agent (xem api.js).
   -->
   <div id="banner" role="status" hidden></div>
   <div id="toasts" aria-live="assertive"></div>
@@ -22,7 +21,6 @@
       <p><label>Password: <input id="login-pass" type="password" required></label></p>
       <p id="login-error" role="alert" hidden></p>
       <p><button id="login-btn" type="submit">Log in</button></p>
-      <p id="login-hint"></p>
     </form>
   </div>
 
@@ -42,7 +40,7 @@
     <div id="messages" aria-live="polite"></div>
     <form id="composer" autocomplete="off">
       <button id="attach-btn" type="button">Attach file</button>
-      <input id="text-input" placeholder="Type a message… (max 250 bytes)" maxlength="250" size="50" aria-label="Message">
+      <input id="text-input" maxlength="250" size="50" aria-label="Message">
       <button id="send-btn" type="submit">Send</button>
     </form>
     <hr>
