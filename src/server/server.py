@@ -318,33 +318,30 @@ class CcpServer:
                 addr,
             )
             return
-
-        if header.flags & FLAG_ENC:
-            if session.key_c2s is None:
-                log.debug(
-                    "drop %s from %s: ENC before keys ready",
-                    header.packet_type.name,
-                    addr,
-                )
-                return
-            try:
-                payload = gcm_open(
-                    session.key_c2s,
-                    header.packet_number,
-                    data[:HEADER_SIZE],
-                    payload,
-                    direction=DIR_C2S,
-                )
-            except CryptoError:
-                log.debug(
-                    "drop %s from %s: GCM auth failed",
-                    header.packet_type.name,
-                    addr,
-                )
-                return
-            session.use_encryption = True
-        else:
-            session.use_encryption = False
+        # Post-HELLO: require ENC.
+        if not (header.flags & FLAG_ENC) or session.key_c2s is None:
+            log.debug(
+                "drop %s from %s: missing ENC or keys",
+                header.packet_type.name,
+                addr,
+            )
+            return
+        try:
+            payload = gcm_open(
+                session.key_c2s,
+                header.packet_number,
+                data[:HEADER_SIZE],
+                payload,
+                direction=DIR_C2S,
+            )
+        except CryptoError:
+            log.debug(
+                "drop %s from %s: GCM auth failed",
+                header.packet_type.name,
+                addr,
+            )
+            return
+        session.use_encryption = True
 
         handler = self._handlers.get(header.packet_type)
         if handler is None:
@@ -394,6 +391,7 @@ class CcpServer:
             except CryptoError as exc:
                 log.debug("drop HELLO from %s: %s", addr, exc)
                 return
+            session.use_encryption = True
             log.info("new session %08x for %s:%d", session.connection_id, *addr)
         else:
             log.debug("HELLO retransmission from %s: resend HELLO_ACK", addr)
@@ -754,8 +752,7 @@ class CcpServer:
     ) -> None:
         pn = session.allocate_packet_number()
         use_enc = (
-            session.use_encryption
-            and session.key_s2c is not None
+            session.key_s2c is not None
             and packet_type not in (PacketType.HELLO, PacketType.HELLO_ACK)
         )
         if use_enc:
