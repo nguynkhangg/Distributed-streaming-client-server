@@ -307,7 +307,7 @@ Rules:
 
 Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API below is shaped by them.
 
-- **Start-up:** the stock `create_backend()` rejects `127.0.0.1` (and any other address needs raw sockets and root). The agent's own launcher calls `daemon.backend.run_backend_standard(ip, port, app.routes)` instead: normal sockets, one thread per connection, no root.
+- **Start-up:** the assignment requires HTTP over raw sockets, so the agent calls the stock `daemon.backend.create_backend(ip, port, app.routes)`: Linux, root, and an address that is not `127.0.0.1`. Tested on WSL2 with the browser on Windows. Two host settings are needed: the WSL interface MTU must be 1500 (default 1280 makes the framework's 1460-byte segments fail with `Message too long`), and the kernel's RST for the agent port must be dropped (`iptables -A OUTPUT -p tcp --sport <port> --tcp-flags RST RST -j DROP`). The agent has no other mode: normal OS TCP sockets are not accepted.
 - **Routes match the exact path.** `?query` and path parameters give `404`, so every parameter travels in a JSON body and every API call is a `POST`.
 - **A request is read with one `recv(1024)`, headers included.** Chrome headers take about 600 bytes, so the JSON body must stay **under 350 bytes** (400 B worked 15/15, 500 B failed 15/15). Chat text is limited to **250 bytes of UTF-8**.
 - **The status line is always `HTTP/1.1 200`.** Errors are reported in the body only.
@@ -351,7 +351,7 @@ The server does not echo a sender's own messages, so the UI shows its own messag
 
 ### 13.5 Open issues
 
-- Confirm with the instructor that (a) calling `run_backend_standard` from the agent's own launcher is acceptable, and (b) adding the three UI files to `CO3094_streaprous/www/` and `static/` is acceptable. The agent and the UI files only add files; they do not edit existing framework files.
+- Open point: adding the three UI files to `CO3094_streaprous/www/` and `static/` needs to be confirmed as acceptable. The agent and the UI files only add files; they do not edit existing framework files.
 - File selection uses a native dialog opened by the agent (Python `tkinter`), because a browser cannot hand a file to this framework (see 13.1). If that is not acceptable, the user would type a file path instead.
 - Received files: the agent should move the verified file to a `downloads/` folder; there is no download endpoint yet.
 

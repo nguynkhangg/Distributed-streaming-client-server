@@ -2,13 +2,16 @@
 
 The browser only speaks HTTP, so each user runs this agent on their own machine
 (protocol-spec.md section 13). It owns one MessagingClient (UDP/CCP to the server)
-and one HTTP server on 127.0.0.1 built on the instructor's StreapRous framework.
+and one HTTP server built on the course's StreapRous framework.
 
-Run from the repository root:
-    python -m src.client.agent --server-host 127.0.0.1 --server-port 9000 --http-port 8080
+The assignment requires HTTP over the framework's own raw-socket TCP (no OS TCP), so
+the agent needs Linux and root (on Windows use WSL) and an address that is not
+127.0.0.1. Run from the repository root:
+    python3 -m src.client.agent --server-port 9000 --http-port 8080
+and open http://<IP of this machine>:8080/chat.html in the browser.
 
-The framework folder (CO3094_streaprous/) is imported as-is and never modified.
-Its stock create_backend() refuses 127.0.0.1, so run_backend_standard() is called directly.
+The framework folder (CO3094_streaprous/) is imported as-is; create_backend() is its
+stock entry point for raw sockets.
 
 Commands are POST requests with a small JSON body; results come back as events
 through the long-polling endpoint /api/events (see protocol-spec.md 13.3 and 13.4).
@@ -19,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import threading
 from datetime import datetime
@@ -268,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local HTTP agent for the CollabNet web UI")
     parser.add_argument("--server-host", default="127.0.0.1", help="CCP server address")
     parser.add_argument("--server-port", type=int, default=9000, help="CCP server UDP port")
-    parser.add_argument("--http-ip", default="127.0.0.1", help="address for the browser to use")
+    parser.add_argument("--http-ip", default="0.0.0.0",
+                        help="address the browser connects to (raw sockets: never 127.0.0.1)")
     parser.add_argument("--http-port", type=int, default=8080)
     parser.add_argument("--framework-dir", default=str(DEFAULT_FRAMEWORK_DIR),
                         help="folder that contains the StreapRous framework (default: CO3094_streaprous)")
@@ -276,16 +281,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    sys.dont_write_bytecode = True       # keep __pycache__ out of the instructor's folder
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        log.error("raw sockets need Linux and root (on Windows: wsl -d Ubuntu -u root)")
+        return 1
+
+    sys.dont_write_bytecode = True       # keep __pycache__ out of the framework folder
     sys.path.insert(0, args.framework_dir)
-    from daemon.backend import run_backend_standard
+    from daemon.backend import create_backend
 
     agent = Agent(args.server_host, args.server_port)
     app = build_app(agent)
-    log.info("agent for CCP server %s:%d, browser at http://%s:%d/",
-             args.server_host, args.server_port, args.http_ip, args.http_port)
+    log.info("agent for CCP server %s:%d, browser at http://<this machine>:%d/chat.html",
+             args.server_host, args.server_port, args.http_port)
     try:
-        run_backend_standard(args.http_ip, args.http_port, app.routes)
+        create_backend(args.http_ip, args.http_port, app.routes)   # raw sockets, own TCP (needs root)
     except KeyboardInterrupt:
         log.info("shutting down")
     finally:

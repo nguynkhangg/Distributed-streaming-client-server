@@ -7,7 +7,7 @@
  * Trang phải được agent phục vụ (cùng origin, 127.0.0.1) để các lời gọi /api/... tới được agent.
  *
  * ================= HỢP ĐỒNG VỚI AGENT (xem protocol-spec.md mục 13) =================
- * Agent chạy trên StreapRous của thầy (không được sửa): route khớp đúng đường dẫn nên KHÔNG có
+ * Agent chạy trên framework StreapRous của môn học (không sửa file có sẵn): route khớp đúng đường dẫn nên KHÔNG có
  * ?query, MỌI lệnh là POST với body JSON, body phải nhỏ (< 350 byte), mã HTTP luôn là 200.
  *   POST /api/login          {username, password}      -> {ok}; kết quả đến sau qua sự kiện "auth_ack"
  *   POST /api/send           {target, text}            -> {ok}   (target "*" = gửi cho tất cả; text <= 250 byte UTF-8)
