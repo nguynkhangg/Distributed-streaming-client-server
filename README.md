@@ -77,14 +77,14 @@ The assignment expects the server/tracker to handle approximately 10–20 concur
 
 ## 6. Setup and Run
 
-Commands below were tested on Windows (PowerShell) with Python 3.11. Run them from the repository root.
+The instructor requires HTTP over raw sockets (no OS TCP), so the agent runs on **Linux with root**. On Windows use WSL2 (`wsl -d Ubuntu -u root`). Commands below were tested in WSL2 Ubuntu 24.04 (Python 3.12) with the browser on Windows. Run them from the repository root (in WSL: `cd "/mnt/d/<path to the repo>"`).
 
 ### Prerequisites
 
 - Git
+- Linux (or WSL2) and root privileges
 - Python 3.11 or newer
-- The `cryptography` package (see `requirements.txt`)
-- Local network access or localhost for testing
+- The `cryptography` package (see `requirements.txt`; on Ubuntu also `apt install python3-cryptography`)
 
 ### Clone the repository
 
@@ -96,26 +96,33 @@ cd <REPOSITORY_DIRECTORY>
 ### Install dependencies
 
 ```bash
-python -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt   # or: apt install python3-cryptography
 ```
 
 ### Start the server
 
 ```bash
-python -m src.server.server --host 127.0.0.1 --port 9000 --users-file data/users.json --demo-password 123456
+python3 -m src.server.server --host 127.0.0.1 --port 9000 --users-file data/users.json --demo-password 123456
 ```
 
 `--demo-password` creates the accounts `alice, bob, carol, dave, quoc, khang, nhat, tri, an` with that password when `data/users.json` does not exist yet. Use `--host 0.0.0.0` to accept clients from other machines on the LAN.
 
 ### Start a client
 
-**Web UI (agent).** Open one terminal per user, start an agent with its own HTTP port, then open the page in a browser:
+**Web UI (agent, raw-socket HTTP).** The agent builds its own TCP on raw sockets, so the kernel must not interfere. Run once per boot as root (in WSL the first line is needed because its default MTU of 1280 is smaller than the framework's 1460-byte segments):
 
 ```bash
-python -m src.client.agent --server-host 127.0.0.1 --server-port 9000 --http-port 8080
+ip link set dev eth0 mtu 1500
+iptables -A OUTPUT -p tcp --sport 8080 --tcp-flags RST RST -j DROP   # once per agent HTTP port
 ```
 
-Browse to `http://127.0.0.1:8080/chat.html` and log in (for example `alice` / `123456`). For a second user start another agent with `--http-port 8081`, open `http://127.0.0.1:8081/chat.html` in a private window and log in as `bob`. `--server-host` / `--server-port` point the agent at the server.
+Then open one terminal per user and start an agent with its own HTTP port:
+
+```bash
+python3 -m src.client.agent --server-host 127.0.0.1 --server-port 9000 --http-port 8080
+```
+
+The page is `http://<IP of the Linux machine>:8080/chat.html` (get the IP with `hostname -I`; it must not be `127.0.0.1`). Log in (for example `alice` / `123456`). For a second user add the iptables rule for `8081`, start another agent with `--http-port 8081`, open `http://<IP>:8081/chat.html` in a private window and log in as `bob`. `--server-host` / `--server-port` point the agent at the server.
 
 **Command-line client.** The messaging CLI can be used without a browser:
 
@@ -132,7 +139,7 @@ The username must already exist in the server's configured user store.
 ### Run tests
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
 Known limitations at the time of writing: file transfer is not wired into the server and client yet (the page reports that it is not implemented), and the client does not enable payload encryption yet.
