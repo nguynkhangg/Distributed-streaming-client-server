@@ -11,9 +11,7 @@
  *   - Nội dung do người dùng gõ luôn được đưa vào DOM bằng textContent (hàm h()), không dùng
  *     innerHTML, để tránh chèn mã độc (XSS).
  *
- * Đang chạy dữ liệu giả (mock)? Xem hướng dẫn TẮT MOCK ở đầu file api.js
- * (đổi USE_MOCK = false, hoặc thêm ?mock=0 vào URL). Dòng "?as=<tên>" ở cuối file chỉ có tác dụng
- * khi mock đang bật, dùng để tự đăng nhập khi thử giao diện.
+ 
  */
 
 const ERROR_TEXT = {
@@ -367,7 +365,6 @@ function handleEvents(events) {
 /* ------------------------------------------------------------------ */
 /* Start                                                              */
 /* ------------------------------------------------------------------ */
-if (MOCK) $("login-hint").textContent = "Mock mode — not connected to a real agent.";
 renderTransfers();
 Api.startEvents(handleEvents, (up) => {
   if (S.link === up) return;
@@ -375,6 +372,3 @@ Api.startEvents(handleEvents, (up) => {
   renderBanner();
   if (S.me) renderHeader();
 });
-
-const autoUser = new URLSearchParams(location.search).get("as");
-if (MOCK && autoUser) submitLogin(autoUser, "demo");

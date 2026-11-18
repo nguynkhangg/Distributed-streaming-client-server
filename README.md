@@ -2,7 +2,7 @@
 
 Course project for **Network Application Development**.
 
-> **Project status:** In development. Replace the `TODO` items below when the team finalizes the implementation and runtime instructions.
+> **Project status:** In development. Chat (login, presence, broadcast and private messages) works end to end; file transfer is not wired in yet.
 
 ## 1. Project Overview
 
@@ -27,24 +27,26 @@ The implementation must demonstrate core network-programming concepts using raw 
 Fill this section in after the team confirms the implementation choices.
 
 - **Programming language:** Python
-- **Networking:** Raw sockets; final TCP/UDP responsibilities to be confirmed
-- **Concurrency:** Threading — 16 sharded workers (`Queue(64)` each) + locked session table / heartbeat sweeper
-- **Serialization:** TODO — JSON, XML, or custom binary format
-- **Cryptography:** X25519 ECDH + HKDF + AES-256-GCM (`src/security`); hop-by-hop ENC after HELLO (see protocol-spec §12)
-- **UI:** TODO — implementation approach to be confirmed with the instructor
+- **Networking:** Raw `socket` programming. Client ↔ server: UDP with the custom CCP protocol (sequence numbers, ACK, retransmission). Browser ↔ local agent: HTTP on `127.0.0.1` (see `protocol-spec.md` §2 and §13)
+- **Concurrency:** Threading — shared `submit_datagram` pool + locked session table / heartbeat sweeper
+- **Serialization:** 16-byte binary packet header; control messages are JSON with a 4-byte length prefix
+- **Cryptography:** AES-256-GCM + HKDF (`src/security`); hop-by-hop ENC after HELLO (see protocol-spec §12)
+- **UI:** Plain HTML + client-side JavaScript (`CO3094_streaprous/www/chat.html`, `static/api.js`, `static/app.js`), served by the local agent (`src/client/agent.py`) on the instructor's StreapRous framework
 - **Supported operating systems:** Windows, macOS, and Linux are listed in the assignment requirements
 
-### Important design questions to resolve
+### Design decisions
 
-The assignment describes UDP streaming and requires reliable file transfer over UDP in one milestone, but its technology section also mentions TCP for reliable file/message transfer and UDP for heartbeat/discovery. The team should confirm the intended transport split with the instructor and document the final decision here.
-
-The design requirements allow a CLI or GUI, while milestone 9 asks for an HTTP-based UI with client-side JavaScript only. The assignment also prohibits Flask/Django and WebSockets and requires raw sockets. Confirm how the UI is expected to communicate with the networking implementation before committing to an architecture.
+- **Transport:** everything between client and server runs over UDP (CCP), including messages, heartbeat and file data (`protocol-spec.md` §2). HTTP is used only between the browser and the agent on the same machine.
+- **UI:** a browser cannot send UDP and WebSockets are prohibited, so each user runs an agent (`src/client/agent.py`). The page only renders state and forwards user actions; all protocol logic stays in the agent (`protocol-spec.md` §13).
+- **Open questions for the instructor** are listed in `protocol-spec.md` §13.5.
 
 ## 4. Architecture
 
-Add the finalized architecture diagram here.
+```text
+Browser (HTML + JS) --HTTP, 127.0.0.1:8080--> Agent (src/client/agent.py) --UDP / CCP--> Server (src/server/)
+```
 
-Suggested logical separation:
+Logical separation:
 
 1. **User interface** — login, active-user list, messaging, file-transfer progress, and network status.
 2. **Client networking layer** — connection handling, protocol encoding/decoding, message/file transfer, and payload encryption.
@@ -55,32 +57,33 @@ The assignment expects the server/tracker to handle approximately 10–20 concur
 
 ## 5. Repository Structure
 
-Update this example to match the actual codebase.
-
 ```text
 .
 ├── README.md
 ├── CONTRIBUTING.md
-├── docs/
-│   ├── architecture.md
-│   ├── protocol-spec.md
-│   └── diagrams/
+├── protocol-spec.md        # protocol and local HTTP API
+├── requirements.txt
 ├── src/
-│   ├── client/
-│   ├── server/
-│   └── shared/
+│   ├── client/             # CCP client, messaging, local agent (agent.py)
+│   ├── server/             # UDP server, authentication, sessions
+│   ├── file_transfer/      # chunking, ACK/retransmission, congestion control
+│   ├── security/           # X25519 + AES-256-GCM, worker pool
+│   └── common/             # constants, packet encoding, exceptions
+├── CO3094_streaprous/      # instructor's HTTP framework + the web UI files
+│   ├── www/chat.html
+│   └── static/api.js, app.js
 └── tests/
 ```
 
 ## 6. Setup and Run
 
-> **TODO:** These commands are placeholders until the team selects a language, dependency list, entry-point filenames, and UI/networking architecture. Update this section with tested commands before submission.
+Commands below were tested on Windows (PowerShell) with Python 3.11. Run them from the repository root.
 
 ### Prerequisites
 
 - Git
-- The selected language runtime/compiler and version: TODO
-- Dependencies: TODO
+- Python 3.11 or newer
+- The `cryptography` package (see `requirements.txt`)
 - Local network access or localhost for testing
 
 ### Clone the repository
@@ -92,19 +95,29 @@ cd <REPOSITORY_DIRECTORY>
 
 ### Install dependencies
 
-TODO — add the exact dependency-installation commands for the selected language.
+```bash
+python -m pip install -r requirements.txt
+```
 
 ### Start the server
 
-TODO — add the exact command and required arguments.
+```bash
+python -m src.server.server --host 127.0.0.1 --port 9000 --users-file data/users.json --demo-password 123456
+```
+
+`--demo-password` creates the accounts `alice, bob, carol, dave, quoc, khang, nhat, tri, an` with that password when `data/users.json` does not exist yet. Use `--host 0.0.0.0` to accept clients from other machines on the LAN.
 
 ### Start a client
 
-Open another terminal for each client and run:
+**Web UI (agent).** Open one terminal per user, start an agent with its own HTTP port, then open the page in a browser:
 
-TODO — add the exact client command and explain how to configure the server address/port.
+```bash
+python -m src.client.agent --server-host 127.0.0.1 --server-port 9000 --http-port 8080
+```
 
-The current messaging CLI is available with:
+Browse to `http://127.0.0.1:8080/chat.html` and log in (for example `alice` / `123456`). For a second user start another agent with `--http-port 8081`, open `http://127.0.0.1:8081/chat.html` in a private window and log in as `bob`. `--server-host` / `--server-port` point the agent at the server.
+
+**Command-line client.** The messaging CLI can be used without a browser:
 
 ```bash
 python -m src.client.client --host 127.0.0.1 --port 9000
@@ -118,7 +131,11 @@ The username must already exist in the server's configured user store.
 
 ### Run tests
 
-TODO — add the unit-test and integration-test commands. Include a test with multiple client instances and file-transfer integrity verification.
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+Known limitations at the time of writing: file transfer is not wired into the server and client yet (the page reports that it is not implemented), and the client does not enable payload encryption yet.
 
 ## 7. Protocol Documentation
 
@@ -179,6 +196,6 @@ The assignment asks for a ZIP file or private GitHub repository containing the s
 
 - **Course:** Network Application Development
 - **Project:** Distributed and Streaming-Based Client-Server Collaboration Application
-- **Team members:** TODO — add names and responsibilities
-- **Instructor-approved architecture:** TODO
+- **Team members:** Nguyên Khang (team lead, protocol, integration), Minh Quốc (server, authentication), Minh Nhật (client networking, messaging), Thành An (reliable file transfer), Nhật (concurrency, security, resilience), Minh Trí (web UI, integration testing)
+- **Instructor-approved architecture:** the instructor asked the team to use the StreapRous framework (`CO3094_streaprous/`); open points are listed in `protocol-spec.md` §13.5
 - **Submission deadline:** The assignment states “Sunday, November 17, 2026, at 11:59 PM.” The weekday and date do not appear to match; confirm the actual deadline with the instructor.
