@@ -1,9 +1,8 @@
-"""UDP tests for CCP client handshake and messaging over ECDH/ENC."""
+"""Plaintext UDP tests for CCP client handshake and messaging."""
 
 from __future__ import annotations
 
 import json
-import secrets
 import socket
 import struct
 import threading
@@ -11,43 +10,26 @@ import unittest
 
 from src.client.messaging import MessagingClient
 from src.client.network import CcpClient
-from src.common.constants import MAGIC, VERSION, PacketFlag, PacketType
-from src.security.encryption import (
-    DIR_C2S,
-    DIR_S2C,
-    GCM_TAG_SIZE,
-    KEY_SIZE,
-    CryptoError,
-    derive_keys,
-    generate_x25519_keypair,
-    open as gcm_open,
-    seal,
-)
+from src.common.constants import MAGIC, VERSION, PacketType
 
 HEADER = struct.Struct("!HBBBBIIH")
 STREAM_HEADER = struct.Struct("!IQ")
 FRAME_LENGTH = struct.Struct("!I")
-NONCE_SIZE = 16
-FLAG_ENC = PacketFlag.ENC
 
 
-class EncryptedTestPeer:
-    """CCP test peer with real X25519 HELLO and AES-GCM ENC."""
+class PlaintextTestPeer:
+    """Small plaintext CCP peer for testing client wire behavior without crypto."""
 
     def __init__(self) -> None:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(("127.0.0.1", 0))
         self.address = self.socket.getsockname()
         self.stop_event = threading.Event()
-        # conn_id -> (addr, username, key_c2s, key_s2c)
-        self.sessions: dict[int, tuple] = {}
+        self.sessions: dict[int, tuple[tuple[str, int], str | None]] = {}
         self.next_connection_id = 100
         self.next_server_packet_number = 1
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
-
-    def _send_raw(self, addr: tuple[str, int], packet: bytes) -> None:
-        self.socket.sendto(packet, addr)
 
     def _send(
         self,
@@ -55,32 +37,19 @@ class EncryptedTestPeer:
         packet_type: PacketType,
         connection_id: int,
         payload: bytes = b"",
-        *,
-        key_s2c: bytes | None = None,
     ) -> None:
-        pn = self.next_server_packet_number
+        packet = HEADER.pack(
+            MAGIC,
+            VERSION,
+            int(packet_type),
+            0,
+            0,
+            connection_id,
+            self.next_server_packet_number,
+            len(payload),
+        ) + payload
         self.next_server_packet_number += 1
-        if key_s2c is not None and packet_type not in (
-            PacketType.HELLO,
-            PacketType.HELLO_ACK,
-        ):
-            length = len(payload) + GCM_TAG_SIZE
-            header = HEADER.pack(
-                MAGIC, VERSION, int(packet_type), FLAG_ENC, 0, connection_id, pn, length
-            )
-            packet = header + seal(key_s2c, pn, header, payload, direction=DIR_S2C)
-        else:
-            packet = HEADER.pack(
-                MAGIC,
-                VERSION,
-                int(packet_type),
-                0,
-                0,
-                connection_id,
-                pn,
-                len(payload),
-            ) + payload
-        self._send_raw(addr, packet)
+        self.socket.sendto(packet, addr)
 
     def _send_message(
         self,
@@ -89,7 +58,6 @@ class EncryptedTestPeer:
         message_type: str,
         payload: dict,
         request_id: str,
-        key_s2c: bytes,
     ) -> None:
         message = json.dumps(
             {
@@ -101,13 +69,12 @@ class EncryptedTestPeer:
             separators=(",", ":"),
         ).encode("utf-8")
         frame = FRAME_LENGTH.pack(len(message)) + message
-        stream_id = 0 if message_type != "MSG_DELIVER" else 1
         self._send(
             addr,
             PacketType.DATA,
             connection_id,
-            STREAM_HEADER.pack(stream_id, 0) + frame,
-            key_s2c=key_s2c,
+            STREAM_HEADER.pack(0 if message_type != "MSG_DELIVER" else 1, 0)
+            + frame,
         )
 
     def _serve(self) -> None:
@@ -121,65 +88,38 @@ class EncryptedTestPeer:
                 if self.stop_event.is_set():
                     return
                 raise
-            if len(data) < HEADER.size:
-                continue
-            magic, version, raw_type, flags, _reserved, conn_id, pn, length = (
-                HEADER.unpack(data[: HEADER.size])
+            magic, version, raw_type, _flags, _reserved, conn_id, _number, length = (
+                HEADER.unpack(data[:HEADER.size])
             )
             if magic != MAGIC or version != VERSION or length != len(data) - HEADER.size:
                 continue
-            payload = data[HEADER.size :]
+            payload = data[HEADER.size:]
             packet_type = PacketType(raw_type)
 
             if packet_type == PacketType.HELLO:
-                if len(payload) != KEY_SIZE + NONCE_SIZE:
-                    continue
-                client_pub, client_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
-                server_priv, server_pub = generate_x25519_keypair()
-                server_nonce = secrets.token_bytes(NONCE_SIZE)
-                key_c2s, key_s2c = derive_keys(
-                    server_priv, client_pub, client_nonce, server_nonce
-                )
                 conn_id = self.next_connection_id
                 self.next_connection_id += 1
-                self.sessions[conn_id] = (addr, None, key_c2s, key_s2c)
-                self._send(
-                    addr, PacketType.HELLO_ACK, conn_id, server_pub + server_nonce
-                )
-                continue
-
-            if conn_id not in self.sessions:
-                continue
-            peer_addr, username, key_c2s, key_s2c = self.sessions[conn_id]
-
-            if flags & FLAG_ENC:
-                try:
-                    payload = gcm_open(
-                        key_c2s, pn, data[: HEADER.size], payload, direction=DIR_C2S
-                    )
-                except CryptoError:
-                    continue
-            elif packet_type not in (PacketType.HELLO, PacketType.HELLO_ACK):
+                self.sessions[conn_id] = (addr, None)
+                self._send(addr, PacketType.HELLO_ACK, conn_id, bytes(48))
                 continue
 
             if packet_type == PacketType.PING:
-                self._send(addr, PacketType.PONG, conn_id, key_s2c=key_s2c)
+                self._send(addr, PacketType.PONG, conn_id)
                 continue
             if packet_type == PacketType.CLOSE:
                 self.sessions.pop(conn_id, None)
                 continue
-            if packet_type != PacketType.DATA:
+            if packet_type != PacketType.DATA or conn_id not in self.sessions:
                 continue
 
-            stream_id, _offset = STREAM_HEADER.unpack(payload[: STREAM_HEADER.size])
-            framed = payload[STREAM_HEADER.size :]
-            (frame_length,) = FRAME_LENGTH.unpack(framed[: FRAME_LENGTH.size])
-            message = json.loads(
-                framed[FRAME_LENGTH.size : FRAME_LENGTH.size + frame_length]
-            )
+            stream_id, _offset = STREAM_HEADER.unpack(payload[:STREAM_HEADER.size])
+            framed = payload[STREAM_HEADER.size:]
+            (frame_length,) = FRAME_LENGTH.unpack(framed[:FRAME_LENGTH.size])
+            message = json.loads(framed[FRAME_LENGTH.size:FRAME_LENGTH.size + frame_length])
             body = message["payload"]
             msg_type = message["type"]
             request_id = message["id"]
+            peer_addr, username = self.sessions[conn_id]
 
             if stream_id == 0 and msg_type == "AUTH":
                 if body["password"] != f"{body['username']}-test-password":
@@ -190,14 +130,14 @@ class EncryptedTestPeer:
                     }
                 else:
                     username = body["username"]
-                    self.sessions[conn_id] = (peer_addr, username, key_c2s, key_s2c)
+                    self.sessions[conn_id] = (peer_addr, username)
                     response = {
                         "success": True,
                         "username": username,
                         "error": None,
                     }
                 self._send_message(
-                    peer_addr, conn_id, "AUTH_ACK", response, request_id, key_s2c
+                    peer_addr, conn_id, "AUTH_ACK", response, request_id
                 )
                 if username is not None:
                     self._send_message(
@@ -212,28 +152,26 @@ class EncryptedTestPeer:
                                     "port": address[1],
                                     "status": "online",
                                 }
-                                for address, name, *_ in self.sessions.values()
+                                for address, name in self.sessions.values()
                                 if name is not None
                             ]
                         },
                         "srv-user-list",
-                        key_s2c,
                     )
                 continue
 
             if stream_id == 0 and msg_type == "USER_LIST_REQ":
                 users = [
-                    {
-                        "username": name,
-                        "ip": address[0],
-                        "port": address[1],
-                        "status": "online",
-                    }
-                    for address, name, *_ in self.sessions.values()
+                    {"username": name, "ip": address[0], "port": address[1], "status": "online"}
+                    for address, name in self.sessions.values()
                     if name is not None
                 ]
                 self._send_message(
-                    peer_addr, conn_id, "USER_LIST", {"users": users}, request_id, key_s2c
+                    peer_addr,
+                    conn_id,
+                    "USER_LIST",
+                    {"users": users},
+                    request_id,
                 )
                 continue
 
@@ -244,7 +182,6 @@ class EncryptedTestPeer:
                     "LOGOUT_ACK",
                     {"success": True},
                     request_id,
-                    key_s2c,
                 )
                 continue
 
@@ -253,17 +190,17 @@ class EncryptedTestPeer:
             target = body["target"]
             if target == "*":
                 recipients = [
-                    (other_id, other_addr, other_name, other_s2c)
-                    for other_id, (other_addr, other_name, _, other_s2c) in self.sessions.items()
+                    (other_id, other_addr, other_name)
+                    for other_id, (other_addr, other_name) in self.sessions.items()
                     if other_id != conn_id and other_name is not None
                 ]
             else:
                 recipients = [
-                    (other_id, other_addr, other_name, other_s2c)
-                    for other_id, (other_addr, other_name, _, other_s2c) in self.sessions.items()
+                    (other_id, other_addr, other_name)
+                    for other_id, (other_addr, other_name) in self.sessions.items()
                     if other_name == target
                 ]
-            for other_id, other_addr, _, other_s2c in recipients:
+            for other_id, other_addr, _ in recipients:
                 self._send_message(
                     other_addr,
                     other_id,
@@ -275,7 +212,6 @@ class EncryptedTestPeer:
                         "timestamp": "2026-01-01T00:00:00Z",
                     },
                     f"srv-{self.next_server_packet_number}",
-                    other_s2c,
                 )
 
     def close(self) -> None:
@@ -286,7 +222,7 @@ class EncryptedTestPeer:
 
 class ClientMessagingTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.peer = EncryptedTestPeer()
+        self.peer = PlaintextTestPeer()
         self.clients: list[MessagingClient] = []
         self.addCleanup(self.peer.close)
         self.addCleanup(self._close_clients)
@@ -317,7 +253,6 @@ class ClientMessagingTest(unittest.TestCase):
         client = self.login("alice")
         self.assertNotEqual(client.connection.connection_id, 0)
         self.assertTrue(client.authenticated)
-        self.assertTrue(client.connection._enc_enabled)
         self.assertTrue(client.connection.ping())
         users = client.request_users()
         self.assertEqual([user["username"] for user in users], ["alice"])
