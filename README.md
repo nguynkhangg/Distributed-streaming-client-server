@@ -28,9 +28,9 @@ Fill this section in after the team confirms the implementation choices.
 
 - **Programming language:** Python
 - **Networking:** Raw sockets; final TCP/UDP responsibilities to be confirmed
-- **Concurrency:** Threading — shared `submit_datagram` pool + locked session table / heartbeat sweeper
+- **Concurrency:** Threading — 16 sharded workers (`Queue(64)` each) + locked session table / heartbeat sweeper
 - **Serialization:** TODO — JSON, XML, or custom binary format
-- **Cryptography:** AES-256-GCM + HKDF (`src/security`); hop-by-hop ENC after HELLO (see protocol-spec §12)
+- **Cryptography:** X25519 ECDH + HKDF + AES-256-GCM (`src/security`); hop-by-hop ENC after HELLO (see protocol-spec §12)
 - **UI:** TODO — implementation approach to be confirmed with the instructor
 - **Supported operating systems:** Windows, macOS, and Linux are listed in the assignment requirements
 
