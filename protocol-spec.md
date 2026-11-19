@@ -305,7 +305,7 @@ Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API be
 
 ### 13.2 Conventions
 
-- The agent serves `index.html`, `api.js`, `app.js` (no stylesheet). Page and API share one origin.
+- The agent serves the UI files that sit in the framework folders: `www/chat.html` and `static/api.js`, `static/app.js` (no stylesheet). Open `http://127.0.0.1:8080/chat.html`; `/` stays the framework's sample page. Page and API share one origin.
 - JSON in both directions. Success: `{"ok": true, ...}`. Failure: `{"ok": false, "code": "<section 14 code>", "message": "..."}`, still with HTTP `200`.
 - A command is answered when the agent has accepted it; the result arrives as an event. Not logged in: `NOT_AUTHENTICATED`. Bad JSON or fields: `INVALID_PAYLOAD`.
 
@@ -341,7 +341,7 @@ The server does not echo a sender's own messages, so the UI shows its own messag
 
 ### 13.5 Open issues
 
-- Confirm with the instructor that calling `run_backend_standard` from the agent's own launcher is acceptable (no file in `CO3094_streaprous/` changes).
+- Confirm with the instructor that (a) calling `run_backend_standard` from the agent's own launcher is acceptable, and (b) adding the three UI files to `CO3094_streaprous/www/` and `static/` is acceptable. The agent and the UI files only add files; they do not edit existing framework files.
 - File selection uses a native dialog opened by the agent (Python `tkinter`), because a browser cannot hand a file to this framework (see 13.1). If that is not acceptable, the user would type a file path instead.
 - Received files: the agent should move the verified file to a `downloads/` folder; there is no download endpoint yet.
 
