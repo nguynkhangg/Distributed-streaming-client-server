@@ -325,12 +325,12 @@ Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API be
 |---|---|---|---|
 | `/api/login` | `{"username", "password"}` | `{"ok": true}` | `HELLO` if disconnected, then `AUTH`. Result: `auth_ack` event |
 | `/api/send` | `{"target", "text"}` (`target` is `"*"` or a username; text up to 250 bytes) | `{"ok": true}` | `MSG`. Unknown/offline target: `error` event |
-| `/api/file/offer` | `{"target"}` | `{"ok": true, "ref": "<id>", "filename", "size_bytes"}`, or `"ref": null` if the user closes the dialog | The agent opens a native file dialog on this machine, computes size and SHA-256, sends `FILE_OFFER` |
+| `/api/file/offer` | `{"target", "filename"}` (`filename` is a file name inside the agent's `share` folder) | `{"ok": true, "ref": "<id>", "filename", "size_bytes"}` | The client computes size and SHA-256 and sends `FILE_OFFER` |
 | `/api/file/respond` | `{"file_id", "accepted"}` | `{"ok": true}` | `FILE_RESPONSE` |
 | `/api/logout` | `{}` | `{"ok": true}` | `LOGOUT`, `CLOSE` |
 | `/api/events` | `{"since": <n>}` | `{"events": [...], "next": <n>}` | - |
 
-The server does not echo a sender's own messages, so the UI shows its own message locally after `ok`. File bytes never pass through the browser: the agent reads the chosen file itself. `ref` identifies a sent file until the server assigns `file_id`. If the server refuses an offer, the agent sends an `error` event and a `file` event with `state: "rejected"`.
+The server does not echo a sender's own messages, so the UI shows its own message locally after `ok`. File bytes never pass through the browser: the agent reads the file itself, and only from its `share` folder (a name that leaves the folder is refused with `INVALID_PAYLOAD`). `ref` is the id of a sent file; the `file` events of that transfer carry the same value as `file_id`. If the server refuses an offer, the agent sends an `error` event and a `file` event with `state: "rejected"`.
 
 ### 13.4 Events (long-polling)
 
@@ -352,7 +352,8 @@ The server does not echo a sender's own messages, so the UI shows its own messag
 ### 13.5 Open issues
 
 - Open point: adding the three UI files to `CO3094_streaprous/www/` and `static/` needs to be confirmed as acceptable. The agent and the UI files only add files; they do not edit existing framework files.
-- File selection uses a native dialog opened by the agent (Python `tkinter`), because a browser cannot hand a file to this framework (see 13.1). If that is not acceptable, the user would type a file path instead.
+- File selection: a browser cannot hand a file to this framework (see 13.1), so the user types the name of a file placed in the agent's `share` folder. Restricting the agent to that folder matters because the raw-socket API listens on a LAN address and has no login of its own: without it anyone on the network could ask the agent to send any file of the machine.
+- The local API is not authenticated: anyone who can reach the agent's port can act as the logged-in user. Acceptable for a LAN demo, not for a real deployment.
 - Received files: the agent should move the verified file to a `downloads/` folder; there is no download endpoint yet.
 
 ## 14. Error codes

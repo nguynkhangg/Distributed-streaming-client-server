@@ -1,7 +1,7 @@
 """Local agent: HTTP API for the web UI on top of the CCP messaging client.
 
 The browser only speaks HTTP, so each user runs this agent on their own machine
-(protocol-spec.md section 13). It owns one MessagingClient (UDP/CCP to the server)
+(protocol-spec.md section 13). It owns one CCP client (UDP, via ChatBackend)
 and one HTTP server built on the course's StreapRous framework.
 
 The assignment requires HTTP over the framework's own raw-socket TCP (no OS TCP), so
@@ -15,7 +15,8 @@ stock entry point for raw sockets.
 
 Commands are POST requests with a small JSON body; results come back as events
 through the long-polling endpoint /api/events (see protocol-spec.md 13.3 and 13.4).
-File transfer is not available yet: the client and server have no FILE_* support.
+File transfer is wired through ChatBackend: it works when the client library supports it
+and the server relays files; otherwise the file routes answer an error.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ try:
     from ..common.exceptions import AuthenticationError
 except ImportError:  # run as a script from src/client
     from common.exceptions import AuthenticationError
-from .messaging import MessagingClient
+from .chat_backend import ChatBackend
 from .network import CcpClient
 
 log = logging.getLogger("ccp.agent")
@@ -41,15 +42,19 @@ DEFAULT_FRAMEWORK_DIR = Path(__file__).resolve().parents[2] / "CO3094_streaprous
 LONG_POLL_SECONDS = 25.0
 MAX_TEXT_BYTES = 250          # protocol-spec 13.1: the HTTP request must stay under ~350 bytes
 BROADCAST = "*"
+FILE_POLL_SECONDS = 0.25      # at most about 4 `file` events per second (protocol-spec 13.4)
 
 
 class Agent:
     """State shared by the HTTP routes and the receive thread."""
 
-    def __init__(self, server_host: str, server_port: int) -> None:
+    def __init__(self, server_host: str, server_port: int,
+                 share_dir: str = "share", download_dir: str = "downloads") -> None:
         self.server_host = server_host
         self.server_port = server_port
-        self.client: MessagingClient | None = None
+        self.share_dir = Path(share_dir)
+        self.download_dir = download_dir
+        self.client: ChatBackend | None = None
         self.events: list[dict] = []
         self.cond = threading.Condition()
         self._login_running = False
@@ -84,7 +89,7 @@ class Agent:
         try:
             self.emit(type="conn", state="connecting")
             connection = CcpClient(self.server_host, self.server_port)
-            client = MessagingClient(connection)
+            client = ChatBackend(connection, download_dir=self.download_dir)
             result = client.login(username, password)
             users = client.request_users()
         except AuthenticationError as exc:
@@ -103,6 +108,10 @@ class Agent:
         threading.Thread(
             target=self._receive_loop, args=(client,), name="agent-receive", daemon=True
         ).start()
+        if client.supports_files:
+            threading.Thread(
+                target=self._watch_files, args=(client,), name="agent-files", daemon=True
+            ).start()
 
     def _login_failed(self, connection: CcpClient | None, error: str) -> None:
         if connection is not None:
@@ -113,7 +122,7 @@ class Agent:
         self.emit(type="conn", state="disconnected")
 
     # ---- messages from the server -----------------------------------
-    def _receive_loop(self, client: MessagingClient) -> None:
+    def _receive_loop(self, client: ChatBackend) -> None:
         while self.client is client:
             try:
                 message = client.receive(timeout=1.0)
@@ -128,13 +137,34 @@ class Agent:
             if event is not None:
                 self.emit(**event)
 
-    def _drop(self, client: MessagingClient) -> None:
+    def _watch_files(self, client: ChatBackend) -> None:
+        """Turn the client's transfer list into `file_incoming` / `file` events."""
+        seen: dict[str, tuple] = {}
+        while self.client is client:
+            try:
+                for transfer in client.transfers():
+                    info = client.describe(transfer)
+                    key, snapshot = info["file_id"], (info["state"], info["transferred_bytes"])
+                    if key not in seen:
+                        if info["direction"] == "recv":
+                            self.emit(type="file_incoming", file_id=key, sender=info["peer"],
+                                      filename=info["filename"], size_bytes=info["size_bytes"])
+                        else:
+                            self.emit(type="file", ref=key, **info)
+                    elif seen[key] != snapshot:
+                        self.emit(type="file", ref=key if info["direction"] == "send" else None, **info)
+                    seen[key] = snapshot
+            except Exception:
+                log.exception("file watcher")
+            threading.Event().wait(FILE_POLL_SECONDS)
+
+    def _drop(self, client: ChatBackend) -> None:
         with self.cond:
             if self.client is not client:
                 return
             self.client = None
         try:
-            client.connection.shutdown()
+            client.close()
         except Exception:
             pass
         self.emit(type="conn", state="disconnected")
@@ -156,6 +186,38 @@ class Agent:
         except (ConnectionError, TimeoutError, OSError) as exc:
             return fail("INTERNAL_ERROR", str(exc))
         return {"ok": True}
+
+    def offer_file(self, target: str, filename: str) -> dict:
+        """Offer a file from the share folder; the path never leaves that folder."""
+        client = self.client
+        if client is None:
+            return fail("NOT_AUTHENTICATED", "log in first")
+        if not client.supports_files:
+            return fail("INTERNAL_ERROR", "this client has no file transfer")
+        root = self.share_dir.resolve()
+        path = (root / filename).resolve()
+        if root not in path.parents:          # blocks "../x" and absolute paths: the API is reachable from the LAN
+            return fail("INVALID_PAYLOAD", "the file must be inside the share folder")
+        try:
+            transfer = client.send_file(path, target)
+        except FileNotFoundError:
+            return fail("INVALID_PAYLOAD", "no such file in the share folder")
+        except ValueError as exc:
+            return fail("INVALID_PAYLOAD", str(exc))
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            return fail("INTERNAL_ERROR", str(exc))
+        info = client.describe(transfer)
+        return {"ok": True, "ref": info["file_id"], "filename": info["filename"], "size_bytes": info["size_bytes"]}
+
+    def respond_file(self, file_id: str, accepted: bool) -> dict:
+        client = self.client
+        if client is None:
+            return fail("NOT_AUTHENTICATED", "log in first")
+        try:
+            found = client.respond_file(file_id, accepted)
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            return fail("INTERNAL_ERROR", str(exc))
+        return {"ok": True} if found else fail("TRANSFER_NOT_FOUND", "no incoming transfer with this id")
 
     def logout(self) -> dict:
         with self.cond:
@@ -256,15 +318,24 @@ def build_app(agent: Agent):
             return fail("INVALID_PAYLOAD", "since must be a non-negative integer")
         return agent.events_since(since)
 
-    def file_not_ready(data):
-        return fail("INTERNAL_ERROR", "file transfer is not implemented yet")
+    def file_offer(data):
+        target, filename = data.get("target"), data.get("filename")
+        if not isinstance(target, str) or not target or not isinstance(filename, str) or not filename:
+            return fail("INVALID_PAYLOAD", "target and filename are required")
+        return agent.offer_file(target, filename)
+
+    def file_respond(data):
+        file_id, accepted = data.get("file_id"), data.get("accepted")
+        if not isinstance(file_id, str) or not isinstance(accepted, bool):
+            return fail("INVALID_PAYLOAD", "file_id and accepted are required")
+        return agent.respond_file(file_id, accepted)
 
     route("/api/login", login)
     route("/api/send", send)
     route("/api/events", events)
     route("/api/logout", lambda data: agent.logout())
-    route("/api/file/offer", file_not_ready)
-    route("/api/file/respond", file_not_ready)
+    route("/api/file/offer", file_offer)
+    route("/api/file/respond", file_respond)
     return app
 
 
@@ -275,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--http-ip", default="0.0.0.0",
                         help="address the browser connects to (raw sockets: never 127.0.0.1)")
     parser.add_argument("--http-port", type=int, default=8080)
+    parser.add_argument("--share-dir", default="share",
+                        help="folder whose files can be offered to other users (default: ./share)")
+    parser.add_argument("--download-dir", default="downloads",
+                        help="folder where received files are saved (default: ./downloads)")
     parser.add_argument("--framework-dir", default=str(DEFAULT_FRAMEWORK_DIR),
                         help="folder that contains the StreapRous framework (default: CO3094_streaprous)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -289,7 +364,8 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, args.framework_dir)
     from daemon.backend import create_backend
 
-    agent = Agent(args.server_host, args.server_port)
+    Path(args.share_dir).mkdir(parents=True, exist_ok=True)
+    agent = Agent(args.server_host, args.server_port, args.share_dir, args.download_dir)
     app = build_app(agent)
     log.info("agent for CCP server %s:%d, browser at http://<this machine>:%d/chat.html",
              args.server_host, args.server_port, args.http_port)

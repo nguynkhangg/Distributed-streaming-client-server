@@ -130,9 +130,6 @@ class HttpAdapter:
         response = b""
         try:
             if req.hook:
-                #
-                # TODO (DONE): handle for App hook here
-                #
                 hook_res = req.hook(req.headers, req.body)
                 if inspect.isawaitable(hook_res):
                     hook_res = asyncio.run(hook_res)
@@ -183,10 +180,6 @@ class HttpAdapter:
         
         # Handle request hook
         if req.hook:
-            #
-            # TODO (DONE): handle for App hook here
-            #
-
             hook_res = req.hook(req.headers, req.body)
             if inspect.isawaitable(hook_res):
                 hook_res = asyncio.run(hook_res)
@@ -201,19 +194,12 @@ class HttpAdapter:
         # Send response using streaprous raw connection
         response = response if isinstance(response, bytes) else response.encode("utf-8")
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
-        #
-        # TODO (DONE) run_conn_send packet
-        # run_conn_send(..)
         run_conn_send(raw_socket, conn_info, response)
         
-        # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-        import time
-        time.sleep(5.0)
+        # Wait briefly to ensure response is transmitted, client processes it, and sends ACK
+        time.sleep(1.0)
         
         # Close connection with FIN packet
-        #
-        # TODO (DONE) run_conn_send packet
-        # close_connection(...)
         close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):

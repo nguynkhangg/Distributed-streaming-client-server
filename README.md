@@ -142,7 +142,9 @@ The username must already exist in the server's configured user store.
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
-Known limitation at the time of writing: file transfer is not wired into the server and client yet (the page reports that it is not implemented).
+**Sending a file from the web UI:** put the file in the `share/` folder next to where the agent runs, select a user, press *Attach file* and type the file name. Received files are saved in `downloads/` (`--share-dir` / `--download-dir` change the folders). The agent talks to the client through `src/client/chat_backend.py`, which uses the merged client (`Client`, with file transfer) when it exists and the chat-only client otherwise; the file routes answer an error in the second case.
+
+Known limitation at the time of writing: the server does not relay files yet, so a file offer is not delivered to the other user.
 
 ## 7. Protocol Documentation
 

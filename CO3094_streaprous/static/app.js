@@ -235,13 +235,15 @@ $("composer").addEventListener("submit", async (e) => {
   }
 });
 
-// The agent opens the native file dialog itself, so the browser never handles the file bytes.
+// The agent reads the file itself, so the browser never handles the file bytes.
 $("attach-btn").addEventListener("click", async () => {
   const target = S.active;
   try {
-    const res = await Api.offerFile(target);
+    // The agent only sends files from its "share" folder, so the user types the file name.
+    const filename = (window.prompt("Name of the file to send (it must be in the agent's share folder):") || "").trim();
+    if (!filename) return;
+    const res = await Api.offerFile(target, filename);
     if (!res.ok) return toast(errText(res.code, res.message));
-    if (!res.ref) return; // dialog closed without choosing a file
     if (!findTransfer({ ref: res.ref })) { // the agent's first "file" event may already have created it
       upsertTransfer({ key: res.ref, ref: res.ref, direction: "send", peer: target, filename: res.filename, size_bytes: res.size_bytes, state: "offered" });
       renderTransfers();
