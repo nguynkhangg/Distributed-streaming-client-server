@@ -104,17 +104,54 @@ Open another terminal for each client and run:
 
 TODO — add the exact client command and explain how to configure the server address/port.
 
-The current messaging CLI is available with:
+The CLI client (chat and file upload) is available with:
 
 ```bash
-python -m src.client.client --host 127.0.0.1 --port 9000
+python -m src.client.run_client_cli --host 127.0.0.1 --port 9000
 ```
 
-It prompts for a username and password. Use `/broadcast <message>` to message all
-other logged-in users, `/private <user[,user...]> <message>` to message one or
-more named users, `/users` to refresh the online list, and `/quit` to log out.
-Each private recipient is sent as an individual `MSG` addressed to that username.
-The username must already exist in the server's configured user store.
+| Option | Default | Meaning |
+|---|---|---|
+| `--host` | `127.0.0.1` | Server address |
+| `--port` | `9000` | Server UDP port |
+| `--username` | prompt | Username; asked interactively if omitted |
+| `--hello-attempts` | `3` | `HELLO` attempts before giving up |
+
+The password is always prompted (hidden). The username must already exist in the
+server's user store. After a successful login the CLI shows the command list below.
+
+| Command | Description |
+|---|---|
+| `/broadcast <message>` | Send a message to all other logged-in users |
+| `/private <user[,user...]> <message>` | Send a private message to one or more users (one `MSG` per recipient) |
+| `/users` | Refresh and print the online-user list |
+| `/file <user> <path>` | Offer a file to one user; it is sent in the background once the receiver accepts |
+| `/accept <number>` | Accept a file offered to you (number from `/transfers`); it is saved in `downloads/` |
+| `/reject <number>` | Reject a file offered to you |
+| `/transfers` | List file transfers, sent and received, with state and progress (numbered from 1) |
+| `/cancel <number>` | Cancel a file transfer you sent, or one you accepted, that has not finished |
+| `/help` | Show the command list |
+| `/quit` | Log out and exit (`Ctrl+C` also works) |
+
+File transfer notes:
+
+- A file is sent to one user at a time (no broadcast). The path may be quoted; the
+  file size and SHA-256 are computed before the offer is sent.
+- When someone offers you a file the CLI prints the sender, name and size. Nothing is
+  written until you `/accept`. Received files are saved in `downloads/` (partial
+  data stays in `downloads/.partial/` until the file is verified). An existing file
+  with the same name is overwritten after verification.
+- Transfer states are `offered`, `rejected`, `ready`, `transferring`, `verifying`,
+  `completed`, `failed` and `cancelled`. A sent file is `completed` only after the
+  receiver reports a matching size and SHA-256; a received file only after its size
+  and SHA-256 match the offer, otherwise it is deleted and reported as `failed`.
+- `/cancel` works after the transfer has been accepted (state `ready` or later; for a
+  received file, after `/accept`). A transfer also ends as `failed` if the connection
+  is lost, the sent file changes or becomes unreadable, a received segment is
+  invalid, or the server sends an invalid `FILE_READY`.
+- File transfer needs a server that implements the file messages of section 11 of
+  [`protocol-spec.md`](protocol-spec.md) (`FILE_OFFER`, `FILE_INCOMING`,
+  `FILE_RESPONSE`, `FILE_ACCEPT`, `FILE_READY`, `FILE_COMPLETE`, `FILE_CANCEL`).
 
 ### Run tests
 
