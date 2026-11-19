@@ -141,7 +141,7 @@ Each stream has its own receive buffer. Out-of-order segments wait until the gap
 - The sender keeps a record per unacknowledged `DATA` packet: packet number, stream ID, offset, length, send time.
 - A packet is considered lost if three packets sent after it have been acknowledged, or if its RTO expires.
 - Lost data is resent in a new packet. Only the missing data is retransmitted.
-- The receiver sends an `ACK` after every 2 `DATA` packets, after 25 ms, or immediately when a gap is detected.
+- The receiver sends an `ACK` after every 2 `DATA` packets, after 25 ms, or immediately when a gap is detected. (The client follows this rule; the server acknowledges every `DATA` packet at once.)
 - If the same data is retransmitted 8 times without acknowledgment, the connection is closed with reason `1` and active file transfers fail.
 - The server applies the same rules to streams 0 and 1 in both directions: it acknowledges every `DATA` packet, orders segments by `offset`, ignores a segment whose offset it already has (a resent packet has a new packet number but the same offset), and cuts the byte stream into frames. Control and chat frames that the client has not acknowledged within 0.5 s are sent again with a new packet number (at most 8 times). A frame is split into segments of at most 1000 bytes. The server also copies file segments from the sender's stream to the receiver's stream and resends the ones the receiver does not acknowledge.
 
@@ -149,7 +149,7 @@ Each stream has its own receive buffer. Out-of-order segments wait until the gap
 RFC 6298 style: `RTO = SRTT + 4 * RTTVAR`. Initial value 1 s, minimum 200 ms, doubled after each timeout. RTT samples are taken only from packets that were sent once.
 
 ### Flow control
-Send window = `min(cwnd, recv_window)` using the `recv_window` from the latest `ACK`. Flow control is per connection. Per-stream flow control is not defined in this version. The server advertises a fixed `recv_window` of 256 packets in every `ACK` it sends.
+Send window = `min(cwnd, recv_window)` using the `recv_window` from the latest `ACK`. Flow control is per connection. Per-stream flow control is not defined in this version. The server computes the `recv_window` it advertises as 256 minus the packets it holds for reassembly on streams 0 and 1 (`ClientSession.get_server_recv_window`). When that value is 0 it answers a new `DATA` packet with an `ACK` that advertises window 0 and does not process the packet. **Known gap:** the count of held packets is read from an attribute (`streams`) that the session does not have (the reassembly state is `recv_streams`), so the advertised window is always 256 today. The server does not yet use the client's `recv_window` when it sends.
 
 ### Congestion control
 Planned in stages:
@@ -454,6 +454,6 @@ stateDiagram-v2
 | Max control message | 64 KiB |
 | Server relay buffer per transfer | not used (segments are forwarded at once) |
 | Server resend of control, chat and file segments | after 0.5 s without `ACK`, at most 8 times; checked every 0.25 s |
-| Server `recv_window` | 256 packets (fixed) |
+| Server `recv_window` | 256 packets minus packets held for reassembly (always 256 today, see section 6) |
 | Maximum file size accepted by the server | 1 GiB |
 
