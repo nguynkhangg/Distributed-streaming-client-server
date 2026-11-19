@@ -42,7 +42,7 @@ class RecordingServer(CcpServer):
     """CcpServer whose outgoing traffic is recorded instead of sent."""
 
     def __init__(self, users):
-        super().__init__("127.0.0.1", 0, users=users)
+        super().__init__("127.0.0.1", 0, users=users, require_encryption=False)   # tests use a HELLO without a key
         self.messages = []     # (connection_id, stream_id, decoded JSON message)
         self.packets = []      # (connection_id, PacketType, payload): CLOSE, PING, HELLO_ACK ...
         self.order = []        # ("msg" | "pkt", connection_id, label) in sending order

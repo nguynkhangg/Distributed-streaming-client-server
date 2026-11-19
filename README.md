@@ -2,7 +2,7 @@
 
 Course project for **Network Application Development**.
 
-> **Project status:** In development. Chat (login, presence, broadcast and private messages) works end to end; file transfer is not wired in yet.
+> **Project status:** In development. Chat (login, presence, broadcast and private messages) and file transfer work end to end, also with 5% and 10% datagram loss (see `tests/test_reliability.py`).
 
 ## 1. Project Overview
 
@@ -169,9 +169,10 @@ File transfer notes:
   received file, after `/accept`). A transfer also ends as `failed` if the connection
   is lost, the sent file changes or becomes unreadable, a received segment is
   invalid, or the server sends an invalid `FILE_READY`.
-- File transfer needs a server that implements the file messages of section 11 of
+- The server implements the file messages of section 11 of
   [`protocol-spec.md`](protocol-spec.md) (`FILE_OFFER`, `FILE_INCOMING`,
-  `FILE_RESPONSE`, `FILE_ACCEPT`, `FILE_READY`, `FILE_COMPLETE`, `FILE_CANCEL`).
+  `FILE_RESPONSE`, `FILE_ACCEPT`, `FILE_READY`, `FILE_COMPLETE`, `FILE_CANCEL`) in `src/server/file_relay.py`.
+- The server requires encryption: packets after `HELLO` that are not AES-GCM encrypted are dropped. `--allow-plaintext` turns this off for development only.
 
 ### Run tests
 

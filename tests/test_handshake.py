@@ -52,7 +52,7 @@ class HandshakeIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.port = unused_local_port()
-        cls.server = CcpServer("127.0.0.1", cls.port)
+        cls.server = CcpServer("127.0.0.1", cls.port, require_encryption=False)   # the manual-wire test sends plain packets
         cls.server_thread = threading.Thread(
             target=cls.server.serve_forever,
             name="ccp-test-server",

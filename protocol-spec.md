@@ -143,6 +143,7 @@ Each stream has its own receive buffer. Out-of-order segments wait until the gap
 - Lost data is resent in a new packet. Only the missing data is retransmitted.
 - The receiver sends an `ACK` after every 2 `DATA` packets, after 25 ms, or immediately when a gap is detected.
 - If the same data is retransmitted 8 times without acknowledgment, the connection is closed with reason `1` and active file transfers fail.
+- The server applies the same rules to streams 0 and 1 in both directions: it acknowledges every `DATA` packet, orders segments by `offset`, ignores a segment whose offset it already has (a resent packet has a new packet number but the same offset), and cuts the byte stream into frames. Control and chat frames that the client has not acknowledged within 0.5 s are sent again with a new packet number (at most 8 times). A frame is split into segments of at most 1000 bytes. The server also copies file segments from the sender's stream to the receiver's stream and resends the ones the receiver does not acknowledge.
 
 ### RTO
 RFC 6298 style: `RTO = SRTT + 4 * RTTVAR`. Initial value 1 s, minimum 200 ms, doubled after each timeout. RTT samples are taken only from packets that were sent once.
@@ -290,7 +291,7 @@ Rules:
 - Passwords travel only inside encrypted `AUTH` messages and are stored hashed with salt.
 - Limitation: the server relays messages and files, so encryption is hop-by-hop and the server can read the content. End-to-end encryption is out of scope.
 - Limitation: `HELLO` is not authenticated, so a man-in-the-middle attack during the handshake is not prevented. Pinning the server public key in the client configuration is a possible improvement.
-- Encryption can be disabled during early development; the final version must have `ENC` enabled.
+- The server requires encryption: after `HELLO` a packet without the `ENC` flag is dropped, and a `HELLO` without a client key is ignored. The server option `--allow-plaintext` turns this off for development only.
 
 ## 13. Web UI and local HTTP API
 ### 13.1 StreapRous constraints
