@@ -24,13 +24,11 @@ The implementation must demonstrate core network-programming concepts using raw 
 
 ## 3. Technology Stack
 
-Fill this section in after the team confirms the implementation choices.
-
 - **Programming language:** Python
-- **Networking:** Raw `socket` programming. Client ↔ server: UDP with the custom CCP protocol (sequence numbers, ACK, retransmission). Browser ↔ local agent: HTTP on `127.0.0.1` (see `protocol-spec.md` §2 and §13)
-- **Concurrency:** Threading — shared `submit_datagram` pool + locked session table / heartbeat sweeper
+- **Networking:** Raw `socket` programming. Client ↔ server: UDP with the custom CCP protocol (sequence numbers, ACK, retransmission). Browser ↔ local agent: HTTP over the StreapRous raw-socket TCP on the machine's own address, not `127.0.0.1` (see `protocol-spec.md` §2 and §13)
+- **Concurrency:** Threading — shared `submit_datagram` pool; one lock per session so a client's packets are handled in order; locked session table; background sweeper for heartbeat, timeouts and resending
 - **Serialization:** 16-byte binary packet header; control messages are JSON with a 4-byte length prefix
-- **Cryptography:** AES-256-GCM + HKDF (`src/security`); hop-by-hop ENC after HELLO (see protocol-spec §12)
+- **Cryptography:** X25519 key exchange + HKDF + AES-256-GCM (`src/security`); hop-by-hop ENC after HELLO, required by the server (see protocol-spec §12)
 - **UI:** Plain HTML + client-side JavaScript (`CO3094_streaprous/www/chat.html`, `static/api.js`, `static/app.js`), served by the local agent (`src/client/agent.py`) on the course's StreapRous framework
 - **Supported operating systems:** Windows, macOS, and Linux are listed in the assignment requirements
 
@@ -43,7 +41,7 @@ Fill this section in after the team confirms the implementation choices.
 ## 4. Architecture
 
 ```text
-Browser (HTML + JS) --HTTP, 127.0.0.1:8080--> Agent (src/client/agent.py) --UDP / CCP--> Server (src/server/)
+Browser (HTML + JS) --HTTP over raw-socket TCP, <agent IP>:8080--> Agent (src/client/agent.py) --UDP / CCP, encrypted--> Server (src/server/)
 ```
 
 Logical separation:
@@ -215,6 +213,8 @@ At minimum, test:
 - Encryption/decryption round trip
 - UI status and file-transfer progress
 - Local-network simulation using multiple client instances
+
+Automated tests (`python3 -m unittest discover -s tests -p "test_*.py"`) include a network that drops 0%, 5% and 10% of the datagrams (`tests/test_reliability.py`): login, ordered messages and a file with matching SHA-256.
 
 Record known limitations and unresolved issues in the technical report.
 
