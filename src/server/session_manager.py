@@ -33,7 +33,8 @@ MAX_PACKET_NUMBER = 0xFFFFFFFF
 NONCE_SIZE = 16
 KEY_SIZE = 32
 DEFAULT_MAX_SESSIONS = 1024
-
+RECV_WINDOW = 256
+MAX_DATA_BYTES = 1000
 
 class SessionState(Enum):
     ESTABLISHED = "established"        # handshake done, not authenticated
@@ -114,6 +115,19 @@ class ClientSession:
     def touch(self) -> None:
         """Record activity. Call only after the packet passed validation/decryption."""
         self.last_recv = time.monotonic()
+
+    def update_client_recv_window(self, recv_window: int) -> None:
+        self.client_recv_window = max(0, min(recv_window, 65535))
+
+    def get_client_recv_window(self) -> int:
+        return self.client_recv_window
+
+    def get_server_recv_window(self, extra_relay_packets: int = 0) -> int:
+        buffered_bytes = 0
+        if hasattr(self, "streams"):
+            buffered_bytes = sum(s.buffered_bytes for s in self.streams.values())
+        buffered_packets = (buffered_bytes + MAX_DATA_BYTES - 1) // MAX_DATA_BYTES
+        return max(0, RECV_WINDOW - buffered_packets - extra_relay_packets)
 
 
 @dataclass(frozen=True)

@@ -395,13 +395,25 @@ class CcpServer:
             )
             return
         session.touch()
+        now = time.monotonic()
         is_data = header.packet_type is PacketType.DATA
-        is_new = session.ack_tracker.on_packet(header.packet_number, is_data, time.monotonic())
         if is_data:
-            if is_new:                      # a resent packet is acknowledged again but not processed twice
+            server_rwnd = session.get_server_recv_window()
+            if (
+                server_rwnd == 0
+                and not session.ack_tracker._contains(header.packet_number)
+                and session.ack_tracker.largest is not None
+            ):
+                self._send(session, PacketType.ACK, session.ack_tracker.build_ack(0))
+                return
+            is_new = session.ack_tracker.on_packet(header.packet_number, True, now)
+            if is_new:
                 self._on_data(session, payload, header.flags)
-            self._send(session, PacketType.ACK, session.ack_tracker.build_ack(RECV_WINDOW))
+                server_rwnd = session.get_server_recv_window()
+            self._send(session, PacketType.ACK, session.ack_tracker.build_ack(server_rwnd))
             return
+
+        session.ack_tracker.on_packet(header.packet_number, False, now)
         handler(session, payload)
 
     def _on_hello(self, header: PacketHeader, payload: bytes, addr: Address) -> None:
