@@ -214,7 +214,7 @@ At minimum, test:
 - UI status and file-transfer progress
 - Local-network simulation using multiple client instances
 
-Automated tests (`python3 -m unittest discover -s tests -p "test_*.py"`) include a network that drops 0%, 5% and 10% of the datagrams (`tests/test_reliability.py`): login, ordered messages and a file with matching SHA-256.
+Automated tests (`python3 -m unittest discover -s tests -p "test_*.py"`) include a network that drops 0%, 5% and 10% of the datagrams (`tests/test_reliability.py`): login, ordered messages and a file with matching SHA-256. `tests/test_resilience.py` covers 20 clients at once, chat that keeps flowing during a file transfer on a lossy network, and a sender or receiver that vanishes in the middle of a transfer.
 
 Record known limitations and unresolved issues in the technical report.
 

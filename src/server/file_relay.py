@@ -177,14 +177,26 @@ class FileRelay:
                         continue
                     del pending[number]
                     if packet.resends >= MAX_RESENDS:
-                        log.warning("giving up on a file packet for %s", receiver.username)
-                        continue
+                        # the receiver does not answer: end its transfers instead of failing packet by packet
+                        log.warning("giving up on a file packet for %s: cancelling its transfers", receiver.username)
+                        pending.clear()
+                        self._cancel_receiver_transfers(receiver, "the receiver does not answer")
+                        break
                     new_number = self._send_data(receiver, packet.stream_id, packet.offset,
                                                  packet.data, packet.fin)
                     pending[new_number] = Pending(packet.stream_id, packet.offset, packet.data,
                                                   packet.fin, now, packet.resends + 1)
 
     # ---- helpers ---------------------------------------------------------
+    def _cancel_receiver_transfers(self, receiver, reason: str) -> None:
+        """Tell the senders that their file cannot reach `receiver` (the lock is already held)."""
+        for transfer in [t for t in self._transfers.values() if t.receiver is receiver]:
+            try:
+                self._send_message(transfer.sender, "FILE_CANCEL", {"file_id": transfer.file_id, "reason": reason})
+            except Exception:
+                log.exception("could not tell %s about a cancelled transfer", transfer.sender.address)
+            self._transfers.pop(transfer.file_id, None)
+
     def on_session_closed(self, session) -> None:
         """A user left: cancel their transfers and tell the other side."""
         with self._lock:
