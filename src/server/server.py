@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
 
+from ..file_transfer.connection import RECV_WINDOW
 from .auth import UsersFileError, UserStore
+from .file_relay import FileRelay
 from .session_manager import (
     KEY_SIZE,
     MAX_AUTH_FAILURES,
@@ -176,6 +178,11 @@ STREAM_OF = {
     "LOGOUT_ACK": 0,
     "ERROR": 0,
     "MSG_DELIVER": 1,
+    "FILE_INCOMING": 0,
+    "FILE_ACCEPT": 0,
+    "FILE_READY": 0,
+    "FILE_COMPLETE": 0,
+    "FILE_CANCEL": 0,
 }
 
 
@@ -203,7 +210,15 @@ class CcpServer:
         self._users = users if users is not None else UserStore()
         self._presence_lock = threading.Lock()
         self._event_ids = itertools.count(1)
+        self._relay = FileRelay(
+            self._send_message, self._send_error, self._send_file_data,
+            lambda name: self._sessions.get_by_username(name), lambda name: self._users.user_exists(name),
+        )
         self._message_handlers = {
+            "FILE_OFFER": self._relay.on_offer,
+            "FILE_RESPONSE": self._relay.on_response,
+            "FILE_COMPLETE": self._relay.on_complete,
+            "FILE_CANCEL": self._relay.on_cancel,
             "AUTH": self._handle_auth,
             "USER_LIST_REQ": self._handle_user_list_req,
             "MSG": self._handle_msg,
@@ -297,6 +312,7 @@ class CcpServer:
             self._close_session(session, CloseReason.TIMEOUT, "timeout")
         for session in self._sessions.find_idle(now):
             self._send(session, PacketType.PING)
+        self._relay.resend_late(now)
 
     # ---- packet-layer dispatch ----------------------------------------
 
@@ -352,6 +368,13 @@ class CcpServer:
             )
             return
         session.touch()
+        is_data = header.packet_type is PacketType.DATA
+        is_new = session.ack_tracker.on_packet(header.packet_number, is_data, time.monotonic())
+        if is_data:
+            if is_new:                      # a resent packet is acknowledged again but not processed twice
+                self._on_data(session, payload, header.flags)
+            self._send(session, PacketType.ACK, session.ack_tracker.build_ack(RECV_WINDOW))
+            return
         handler(session, payload)
 
     def _on_hello(self, header: PacketHeader, payload: bytes, addr: Address) -> None:
@@ -416,7 +439,7 @@ class CcpServer:
         if result is not None:
             self._handle_removed(result, "client CLOSE")
 
-    def _on_data(self, session: ClientSession, payload: bytes) -> None:
+    def _on_data(self, session: ClientSession, payload: bytes, flags: int = 0) -> None:
         if not payload:
             return
         # Support direct unframed JSON as well as stream-framed DATA segments
@@ -431,6 +454,8 @@ class CcpServer:
         if stream_id in (0, 1):
             for frame_bytes in self._extract_stream_frames(stream_body):
                 self._dispatch_control_json(session, frame_bytes)
+        elif session.state is SessionState.AUTHENTICATED:
+            self._relay.on_data(session, stream_id, _offset, stream_body, bool(flags & FLAG_FIN))
 
     @staticmethod
     def _extract_stream_frames(stream_body: bytes) -> list[bytes]:
@@ -450,12 +475,14 @@ class CcpServer:
 
     def _on_ack(self, session: ClientSession, payload: bytes) -> None:
         log.debug("ACK from %s (%d bytes)", session.address, len(payload))
+        self._relay.on_ack(session, payload)
 
     # ---- session removal & presence helpers ---------------------------
 
     def _handle_removed(self, result: RemoveResult, why: str) -> None:
         session = result.session
         log.info("session %08x (%s:%d) closed: %s", session.connection_id, *session.address, why)
+        self._relay.on_session_closed(session)
         if result.went_offline:
             with self._presence_lock:
                 self._fan_out(
@@ -744,12 +771,20 @@ class CcpServer:
         stream_header = struct.pack(STREAM_HEADER_FORMAT, stream_id, offset)
         self._send(session, PacketType.DATA, stream_header + frame)
 
+    def _send_file_data(self, session: ClientSession, stream_id: int, offset: int,
+                        data: bytes, fin: bool) -> int:
+        """Send one file segment on the receiver's stream; returns the packet number used."""
+        return self._send(session, PacketType.DATA,
+                          struct.pack(STREAM_HEADER_FORMAT, stream_id, offset) + data,
+                          FLAG_FIN if fin else 0)
+
     def _send(
         self,
         session: ClientSession,
         packet_type: PacketType,
         payload: bytes = b"",
-    ) -> None:
+        extra_flags: int = 0,
+    ) -> int:
         pn = session.allocate_packet_number()
         use_enc = (
             session.key_s2c is not None
@@ -762,7 +797,7 @@ class CcpServer:
                 MAGIC,
                 VERSION,
                 int(packet_type),
-                FLAG_ENC,
+                FLAG_ENC | extra_flags,
                 0,
                 session.connection_id,
                 pn,
@@ -771,11 +806,12 @@ class CcpServer:
             body = seal(session.key_s2c, pn, header16, payload, direction=DIR_S2C)
             raw = header16 + body
         else:
-            raw = pack_packet(packet_type, session.connection_id, pn, payload, 0)
+            raw = pack_packet(packet_type, session.connection_id, pn, payload, extra_flags)
         try:
             self._sock.sendto(raw, session.address)
         except OSError as exc:
             log.warning("send %s to %s failed: %s", packet_type.name, session.address, exc)
+        return pn
 
     def _send_close(self, session: ClientSession, reason: CloseReason) -> None:
         self._send(session, PacketType.CLOSE, bytes([reason]))

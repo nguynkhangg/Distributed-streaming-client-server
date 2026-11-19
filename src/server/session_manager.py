@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 
+from ..file_transfer.reliability import AckTracker
 from ..security.encryption import generate_x25519_keypair
 Address = tuple[str, int]
 
@@ -80,6 +81,8 @@ class ClientSession:
     use_encryption: bool = False
     wire_mode: str = "packet"
     stream_offsets: dict[int, int] = field(default_factory=dict)
+    # Packet numbers received from this client: used to ACK DATA and drop resent duplicates.
+    ack_tracker: AckTracker = field(default_factory=AckTracker, repr=False)
     created_at: float = field(default_factory=time.monotonic)
     last_recv: float = field(default_factory=time.monotonic)
     last_send: float = field(default_factory=time.monotonic)

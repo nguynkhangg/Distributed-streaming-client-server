@@ -1,7 +1,7 @@
 """Local agent: HTTP API for the web UI on top of the CCP messaging client.
 
 The browser only speaks HTTP, so each user runs this agent on their own machine
-(protocol-spec.md section 13). It owns one CCP client (UDP, via ChatBackend)
+(protocol-spec.md section 13). It owns one CCP client (UDP, src/client/client.py)
 and one HTTP server built on the course's StreapRous framework.
 
 The assignment requires HTTP over the framework's own raw-socket TCP (no OS TCP), so
@@ -15,8 +15,7 @@ stock entry point for raw sockets.
 
 Commands are POST requests with a small JSON body; results come back as events
 through the long-polling endpoint /api/events (see protocol-spec.md 13.3 and 13.4).
-File transfer is wired through ChatBackend: it works when the client library supports it
-and the server relays files; otherwise the file routes answer an error.
+File transfer uses the client's send_file / respond_file and works once the server relays files.
 """
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ try:
     from ..common.exceptions import AuthenticationError
 except ImportError:  # run as a script from src/client
     from common.exceptions import AuthenticationError
-from .chat_backend import ChatBackend
+from .client import Client, IncomingTransfer
 from .network import CcpClient
 
 log = logging.getLogger("ccp.agent")
@@ -54,7 +53,7 @@ class Agent:
         self.server_port = server_port
         self.share_dir = Path(share_dir)
         self.download_dir = download_dir
-        self.client: ChatBackend | None = None
+        self.client: Client | None = None
         self.events: list[dict] = []
         self.cond = threading.Condition()
         self._login_running = False
@@ -89,7 +88,7 @@ class Agent:
         try:
             self.emit(type="conn", state="connecting")
             connection = CcpClient(self.server_host, self.server_port)
-            client = ChatBackend(connection, download_dir=self.download_dir)
+            client = Client(connection, download_dir=self.download_dir)
             result = client.login(username, password)
             users = client.request_users()
         except AuthenticationError as exc:
@@ -108,10 +107,9 @@ class Agent:
         threading.Thread(
             target=self._receive_loop, args=(client,), name="agent-receive", daemon=True
         ).start()
-        if client.supports_files:
-            threading.Thread(
-                target=self._watch_files, args=(client,), name="agent-files", daemon=True
-            ).start()
+        threading.Thread(
+            target=self._watch_files, args=(client,), name="agent-files", daemon=True
+        ).start()
 
     def _login_failed(self, connection: CcpClient | None, error: str) -> None:
         if connection is not None:
@@ -122,7 +120,7 @@ class Agent:
         self.emit(type="conn", state="disconnected")
 
     # ---- messages from the server -----------------------------------
-    def _receive_loop(self, client: ChatBackend) -> None:
+    def _receive_loop(self, client: Client) -> None:
         while self.client is client:
             try:
                 message = client.receive(timeout=1.0)
@@ -137,13 +135,13 @@ class Agent:
             if event is not None:
                 self.emit(**event)
 
-    def _watch_files(self, client: ChatBackend) -> None:
+    def _watch_files(self, client: Client) -> None:
         """Turn the client's transfer list into `file_incoming` / `file` events."""
         seen: dict[str, tuple] = {}
         while self.client is client:
             try:
                 for transfer in client.transfers():
-                    info = client.describe(transfer)
+                    info = describe(client, transfer)
                     key, snapshot = info["file_id"], (info["state"], info["transferred_bytes"])
                     if key not in seen:
                         if info["direction"] == "recv":
@@ -158,13 +156,13 @@ class Agent:
                 log.exception("file watcher")
             threading.Event().wait(FILE_POLL_SECONDS)
 
-    def _drop(self, client: ChatBackend) -> None:
+    def _drop(self, client: Client) -> None:
         with self.cond:
             if self.client is not client:
                 return
             self.client = None
         try:
-            client.close()
+            client.connection.shutdown()
         except Exception:
             pass
         self.emit(type="conn", state="disconnected")
@@ -192,8 +190,6 @@ class Agent:
         client = self.client
         if client is None:
             return fail("NOT_AUTHENTICATED", "log in first")
-        if not client.supports_files:
-            return fail("INTERNAL_ERROR", "this client has no file transfer")
         root = self.share_dir.resolve()
         path = (root / filename).resolve()
         if root not in path.parents:          # blocks "../x" and absolute paths: the API is reachable from the LAN
@@ -206,18 +202,22 @@ class Agent:
             return fail("INVALID_PAYLOAD", str(exc))
         except (ConnectionError, TimeoutError, OSError) as exc:
             return fail("INTERNAL_ERROR", str(exc))
-        info = client.describe(transfer)
+        info = describe(client, transfer)
         return {"ok": True, "ref": info["file_id"], "filename": info["filename"], "size_bytes": info["size_bytes"]}
 
     def respond_file(self, file_id: str, accepted: bool) -> dict:
         client = self.client
         if client is None:
             return fail("NOT_AUTHENTICATED", "log in first")
+        transfer = next((t for t in client.transfers()
+                         if isinstance(t, IncomingTransfer) and t.file_id == file_id), None)
+        if transfer is None:
+            return fail("TRANSFER_NOT_FOUND", "no incoming transfer with this id")
         try:
-            found = client.respond_file(file_id, accepted)
+            client.respond_file(transfer, accepted)
         except (ConnectionError, TimeoutError, OSError) as exc:
             return fail("INTERNAL_ERROR", str(exc))
-        return {"ok": True} if found else fail("TRANSFER_NOT_FOUND", "no incoming transfer with this id")
+        return {"ok": True}
 
     def logout(self) -> dict:
         with self.cond:
@@ -229,6 +229,21 @@ class Agent:
                 log.info("logout: %s", exc)
             self.emit(type="conn", state="disconnected")
         return {"ok": True}
+
+
+def describe(client: Client, transfer) -> dict:
+    """One transfer as the fields of a `file` event (protocol-spec 13.4)."""
+    meta = transfer.record.metadata
+    incoming = isinstance(transfer, IncomingTransfer)
+    return {
+        "file_id": meta.file_id,
+        "direction": "recv" if incoming else "send",
+        "peer": meta.sender if incoming else meta.target,
+        "filename": meta.filename,
+        "size_bytes": meta.size_bytes,
+        "state": getattr(transfer.record.state, "value", str(transfer.record.state)),
+        "transferred_bytes": client.transfer_progress(transfer),
+    }
 
 
 def fail(code: str, message: str = "") -> dict:

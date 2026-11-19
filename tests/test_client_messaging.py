@@ -9,7 +9,7 @@ import struct
 import threading
 import unittest
 
-from src.client.messaging import MessagingClient
+from src.client.client import Client
 from src.client.network import CcpClient
 from src.common.constants import MAGIC, VERSION, PacketFlag, PacketType
 from src.security.encryption import (
@@ -43,6 +43,7 @@ class EncryptedTestPeer:
         self.sessions: dict[int, tuple] = {}
         self.next_connection_id = 100
         self.next_server_packet_number = 1
+        self.stream_offsets: dict[tuple[int, int], int] = {}   # (connection, stream) -> next offset
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
@@ -102,11 +103,13 @@ class EncryptedTestPeer:
         ).encode("utf-8")
         frame = FRAME_LENGTH.pack(len(message)) + message
         stream_id = 0 if message_type != "MSG_DELIVER" else 1
+        offset = self.stream_offsets.get((connection_id, stream_id), 0)
+        self.stream_offsets[(connection_id, stream_id)] = offset + len(frame)
         self._send(
             addr,
             PacketType.DATA,
             connection_id,
-            STREAM_HEADER.pack(stream_id, 0) + frame,
+            STREAM_HEADER.pack(stream_id, offset) + frame,
             key_s2c=key_s2c,
         )
 
@@ -287,7 +290,7 @@ class EncryptedTestPeer:
 class ClientMessagingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.peer = EncryptedTestPeer()
-        self.clients: list[MessagingClient] = []
+        self.clients: list[Client] = []
         self.addCleanup(self.peer.close)
         self.addCleanup(self._close_clients)
 
@@ -295,18 +298,18 @@ class ClientMessagingTest(unittest.TestCase):
         for client in self.clients:
             client.connection.shutdown()
 
-    def login(self, username: str) -> MessagingClient:
+    def login(self, username: str) -> Client:
         connection = CcpClient(
             self.peer.address[0],
             self.peer.address[1],
             receive_timeout=0.5,
         )
-        client = MessagingClient(connection)
+        client = Client(connection)
         client.login(username, f"{username}-test-password")
         self.clients.append(client)
         return client
 
-    def drain(self, client: MessagingClient) -> None:
+    def drain(self, client: Client) -> None:
         while True:
             try:
                 client.receive(timeout=0.05)
@@ -317,7 +320,7 @@ class ClientMessagingTest(unittest.TestCase):
         client = self.login("alice")
         self.assertNotEqual(client.connection.connection_id, 0)
         self.assertTrue(client.authenticated)
-        self.assertTrue(client.connection._enc_enabled)
+        self.assertIsNotNone(client.connection._key_c2s)
         self.assertTrue(client.connection.ping())
         users = client.request_users()
         self.assertEqual([user["username"] for user in users], ["alice"])
