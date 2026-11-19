@@ -64,15 +64,15 @@ The assignment expects the server/tracker to handle approximately 10–20 concur
 ├── protocol-spec.md        # protocol and local HTTP API
 ├── requirements.txt
 ├── src/
-│   ├── client/             # CCP client, messaging, local agent (agent.py)
-│   ├── server/             # UDP server, authentication, sessions
+│   ├── client/             # CCP client (client.py), network/transport, CLI, local agent (agent.py)
+│   ├── server/             # UDP server, authentication, sessions, file relay
 │   ├── file_transfer/      # chunking, ACK/retransmission, congestion control
 │   ├── security/           # X25519 + AES-256-GCM, worker pool
-│   └── common/             # constants, packet encoding, exceptions
+│   └── common/             # constants, exceptions
 ├── CO3094_streaprous/      # course HTTP framework + the web UI files
 │   ├── www/chat.html
 │   └── static/api.js, app.js
-└── tests/
+└── tests/                  # unit tests; manual_server_handshake.py is a manual script
 ```
 
 ## 6. Setup and Run

@@ -41,7 +41,8 @@ from ..security.encryption import (
     GCM_TAG_SIZE,
     KEY_SIZE,
     CryptoError,
-    derive_keys,
+    derive_session_keys,
+    x25519_shared_secret,
     generate_x25519_keypair,
     open as gcm_open,
     seal,
@@ -304,8 +305,9 @@ class CcpClient:
             self.server_nonce = payload[KEY_SIZE:]
             if self.encryption:
                 try:
-                    self._key_c2s, self._key_s2c = derive_keys(
-                        private_key, self.server_public_key, client_nonce, self.server_nonce
+                    shared = x25519_shared_secret(private_key, self.server_public_key)
+                    self._key_c2s, self._key_s2c = derive_session_keys(
+                        shared, client_nonce, self.server_nonce
                     )
                 except CryptoError as exc:
                     self.connection_id = 0

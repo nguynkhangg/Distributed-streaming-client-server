@@ -17,7 +17,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from ..file_transfer.packet import decode_ack_payload
+try:
+    from ..file_transfer.packet import decode_ack_payload
+except ImportError:
+    from src.file_transfer.packet import decode_ack_payload
 
 log = logging.getLogger("ccp.relay")
 

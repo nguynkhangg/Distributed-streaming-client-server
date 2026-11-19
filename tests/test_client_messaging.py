@@ -18,8 +18,9 @@ from src.security.encryption import (
     GCM_TAG_SIZE,
     KEY_SIZE,
     CryptoError,
-    derive_keys,
+    derive_session_keys,
     generate_x25519_keypair,
+    x25519_shared_secret,
     open as gcm_open,
     seal,
 )
@@ -140,8 +141,8 @@ class EncryptedTestPeer:
                 client_pub, client_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
                 server_priv, server_pub = generate_x25519_keypair()
                 server_nonce = secrets.token_bytes(NONCE_SIZE)
-                key_c2s, key_s2c = derive_keys(
-                    server_priv, client_pub, client_nonce, server_nonce
+                key_c2s, key_s2c = derive_session_keys(
+                    x25519_shared_secret(server_priv, client_pub), client_nonce, server_nonce
                 )
                 conn_id = self.next_connection_id
                 self.next_connection_id += 1

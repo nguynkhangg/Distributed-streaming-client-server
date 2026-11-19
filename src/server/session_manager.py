@@ -16,8 +16,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 
-from ..file_transfer.reliability import AckTracker
-from ..security.encryption import generate_x25519_keypair
+try:
+    from ..file_transfer.reliability import AckTracker
+except ImportError:
+    from src.file_transfer.reliability import AckTracker
+
 Address = tuple[str, int]
 
 AUTH_DEADLINE = 10.0          # seconds after handshake to send AUTH (section 7)
@@ -75,7 +78,7 @@ class ClientSession:
     username: str | None = None
     failed_auth_count: int = 0
     next_packet_number: int = 0
-    # Filled after HELLO via ECDH derive_keys
+    # Filled after HELLO (derive_session_keys or derive_keys fallback)
     key_c2s: bytes | None = None
     key_s2c: bytes | None = None
     use_encryption: bool = False
@@ -155,6 +158,8 @@ class SessionManager:
                 server_public = self._server_key_factory()
                 server_private = None
             else:
+                from ..security.encryption import generate_x25519_keypair
+
                 server_private, server_public = generate_x25519_keypair()
             session = ClientSession(
                 connection_id=connection_id,
