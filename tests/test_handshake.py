@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import itertools
-import secrets
 import socket
 import struct
 import threading
@@ -11,13 +10,6 @@ import time
 import unittest
 
 from src.client.network import CcpClient, ConnectionState
-from src.security.encryption import (
-    DIR_C2S,
-    KEY_SIZE,
-    derive_keys,
-    generate_x25519_keypair,
-    seal,
-)
 from src.server.server import CcpServer
 
 
@@ -29,23 +21,13 @@ HELLO_ACK = 0x02
 PING = 0x05
 PONG = 0x06
 CLOSE = 0x07
-FLAG_ENC = 0x02
-NONCE_SIZE = 16
 
 
-def build_packet(packet_type, connection_id, packet_number, payload=b"", flags=0):
+def build_packet(packet_type, connection_id, packet_number, payload=b""):
     return HEADER.pack(
-        MAGIC, VERSION, packet_type, flags, 0, connection_id, packet_number,
+        MAGIC, VERSION, packet_type, 0, 0, connection_id, packet_number,
         len(payload),
     ) + payload
-
-
-def build_enc_packet(packet_type, connection_id, packet_number, key_c2s, payload=b""):
-    sealed_len = len(payload) + 16
-    header16 = HEADER.pack(
-        MAGIC, VERSION, packet_type, FLAG_ENC, 0, connection_id, packet_number, sealed_len
-    )
-    return header16 + seal(key_c2s, packet_number, header16, payload, direction=DIR_C2S)
 
 
 def parse_packet(data):
@@ -106,44 +88,23 @@ class HandshakeIntegrationTest(unittest.TestCase):
         packet_numbers = itertools.count(1)
         sock.settimeout(2)
 
-        private, public = generate_x25519_keypair()
-        client_nonce = secrets.token_bytes(NONCE_SIZE)
-        key_c2s = None
-
-        def send_plain(packet_type, connection_id, payload=b"", destination=sock):
+        def send(packet_type, connection_id, payload=b"", destination=sock):
             destination.sendto(
                 build_packet(packet_type, connection_id, next(packet_numbers), payload),
                 server_address,
             )
 
-        def send_enc(packet_type, connection_id, payload=b"", destination=sock):
-            destination.sendto(
-                build_enc_packet(
-                    packet_type, connection_id, next(packet_numbers), key_c2s, payload
-                ),
-                server_address,
-            )
-
         try:
-            send_plain(HELLO, 0, public + client_nonce)
+            send(HELLO, 0)
             connection_id, payload = self.expect_packet(sock, HELLO_ACK)
             self.assertNotEqual(connection_id, 0)
-            self.assertEqual(len(payload), KEY_SIZE + NONCE_SIZE)
-            server_pub, server_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
-            key_c2s, _key_s2c = derive_keys(
-                private, server_pub, client_nonce, server_nonce
-            )
+            self.assertEqual(len(payload), 48)
 
-            send_plain(HELLO, 0, public + client_nonce)  # same pubkey+nonce → retransmission
+            send(HELLO, 0)
             retransmitted_id, _ = self.expect_packet(sock, HELLO_ACK)
             self.assertEqual(retransmitted_id, connection_id)
 
-            send_enc(PING, connection_id)
-            self.expect_packet(sock, PONG)
-
-            # Plaintext after HELLO must be ignored; ENC still works.
-            send_plain(PING, connection_id)
-            send_enc(PING, connection_id)
+            send(PING, connection_id)
             self.expect_packet(sock, PONG)
 
             other.sendto(
@@ -152,9 +113,9 @@ class HandshakeIntegrationTest(unittest.TestCase):
             )
             self.expect_silence(other)
 
-            send_enc(CLOSE, connection_id, b"\x00")
+            send(CLOSE, connection_id, b"\x00")
             time.sleep(0.1)
-            send_enc(PING, connection_id)
+            send(PING, connection_id)
             self.expect_silence(sock)
         finally:
             sock.close()

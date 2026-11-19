@@ -1,4 +1,5 @@
-"""UDP CCP client: ECDH HELLO, ENC, idle heartbeats, framed JSON."""
+"""UDP connection management for the CCP client."""
+
 from __future__ import annotations
 
 import itertools
@@ -29,11 +30,13 @@ from ..file_transfer.packet import (
 from ..file_transfer.reliability import ConnectionFailed
 from .transport import ClientReliableConnection
 from ..common.constants import (
+    MAGIC,
+    VERSION,
     PacketType,
+    HEADER_FORMAT,
     MAX_DATAGRAM_SIZE,
+    DATA_SEGMENT_SIZE,
     CloseReason,
-    HEARTBEAT_INTERVAL,
-    HEARTBEAT_TIMEOUT,
 )
 from ..security.encryption import (
     DIR_C2S,
@@ -45,6 +48,11 @@ from ..security.encryption import (
     generate_x25519_keypair,
     open as gcm_open,
     seal,
+)
+from ..common.exceptions import (
+    HandshakeTimeoutError,
+    MalformedPacketError,
+    UnknownPacketTypeError,
 )
 
 log = logging.getLogger("ccp.client.network")
@@ -65,7 +73,7 @@ class ConnectionState(Enum):
 
 
 class CcpClient:
-    """CCP UDP: ECDH HELLO, ENC after real keys, inbox, idle PING/timeout."""
+    """Own a CCP UDP endpoint, HELLO/HELLO_ACK handshake, and message receive queue."""
 
     def __init__(
         self,
@@ -113,16 +121,17 @@ class CcpClient:
         self._early_file_data: dict[int, list[tuple[int, bytes, bool]]] = {}
         self._closed_file_streams: set[int] = set()
         self._last_receive = self._last_send = time.monotonic()
+        self._stream_offsets = {0: 0, 1: 0}
 
     def clear_keys(self) -> None:
         self._key_c2s = self._key_s2c = None
         self.server_public_key = self.server_nonce = b""
 
     def _next_packet_number(self) -> int:
-        n = next(self._packet_numbers)
-        if n > 0xFFFFFFFF:
+        number = next(self._packet_numbers)
+        if number > 0xFFFFFFFF:
             raise OverflowError("CCP packet number space exhausted")
-        return n
+        return number
 
     def _encode_packet(
         self,
@@ -180,7 +189,6 @@ class CcpClient:
         payload: bytes = b"",
         flags: int = 0,
         connection_id: int | None = None,
-        packet_number: int | None = None,
     ) -> None:
         with self._lock:
             packet = self._encode_packet(
@@ -192,7 +200,6 @@ class CcpClient:
                 encrypt=self.encryption and packet_type != PacketType.HELLO,
             )
             self._socket.sendto(packet, self.server_address)
-            self._last_send = time.monotonic()
 
     def _receive_packet(self, timeout: float):
         deadline = time.monotonic() + timeout
@@ -267,8 +274,12 @@ class CcpClient:
             client_nonce = b""
             hello = b""
         self.state = ConnectionState.HELLO_SENT
-
         for attempt in range(self.hello_attempts):
+            self._send_packet(
+                PacketType.HELLO,
+                b"",
+                connection_id=0,
+            )
             try:
                 self._send_packet(
                     PacketType.HELLO, hello, connection_id=0
@@ -286,7 +297,6 @@ class CcpClient:
                 if attempt + 1 < self.hello_attempts:
                     time.sleep(self.hello_retry_interval)
                     continue
-                self.clear_keys()
                 self.state = ConnectionState.DISCONNECTED
                 raise HandshakeTimeoutError(
                     f"server did not reply to HELLO after {self.hello_attempts} attempts"
@@ -331,7 +341,6 @@ class CcpClient:
             self._receiver_thread.start()
             return connection_id
 
-        self.clear_keys()
         self.state = ConnectionState.DISCONNECTED
         raise HandshakeTimeoutError("failed to establish CCP connection")
 
@@ -552,6 +561,9 @@ class CcpClient:
                 self._messages.append(message)
             self._messages_ready.notify()
 
+        if cursor != len(stream_data):
+            log.debug("discarding DATA payload with trailing bytes")
+
     def send_message(
         self,
         stream_id: int,
@@ -559,6 +571,7 @@ class CcpClient:
         payload: dict,
         request_id: str | None = None,
     ) -> str:
+        """Send one framed JSON message on control stream 0 or chat stream 1."""
         if self.state != ConnectionState.ESTABLISHED:
             raise ConnectionError("CCP connection is not established")
         if stream_id not in (0, 1):
@@ -631,6 +644,7 @@ class CcpClient:
             return self._transport is not None and self._transport.has_unacked_data
 
     def receive_message(self, timeout: float | None = None) -> dict:
+        """Return the next decoded server message, or raise on timeout/disconnect."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._messages_ready:
             while not self._messages:
@@ -652,15 +666,18 @@ class CcpClient:
         request_id: str | None = None,
         timeout: float = 5.0,
     ) -> dict:
+        """Wait for a correlated response without consuming unrelated events."""
         deadline = time.monotonic() + timeout
         with self._messages_ready:
             while True:
-                for i, message in enumerate(self._responses):
+                for index, message in enumerate(self._responses):
                     if (
                         message.get("type") == message_type
                         or message.get("type") == "ERROR"
-                    ) and (request_id is None or message.get("id") == request_id):
-                        del self._responses[i]
+                    ) and (
+                        request_id is None or message.get("id") == request_id
+                    ):
+                        del self._responses[index]
                         return message
                 if self._receiver_error is not None:
                     raise ConnectionError(
@@ -670,7 +687,9 @@ class CcpClient:
                     raise ConnectionError("CCP server closed the connection")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(f"timed out waiting for {message_type} response")
+                    raise TimeoutError(
+                        f"timed out waiting for {message_type} response"
+                    )
                 self._messages_ready.wait(remaining)
 
     def ping(self) -> bool:
@@ -695,7 +714,6 @@ class CcpClient:
                 log.debug("failed to send CLOSE: %s", exc)
         self.connection_id = 0
         self.state = ConnectionState.DISCONNECTED
-        self.clear_keys()
         with self._messages_ready:
             self._messages_ready.notify_all()
 
