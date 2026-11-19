@@ -1,7 +1,7 @@
 # Protocol Specification
 ## Distributed and Streaming-Based Client-Server Collaboration Application
 
-**Status:** Milestone 1 design draft (revision 2)  
+**Status:** Milestone 1 design draft (revision 3)  
 **Language:** Python (`socket`)  
 **Architecture:** Central client-server, server relays messages and files  
 **Protocol version:** 1
@@ -54,6 +54,16 @@ Layers inside the server and the agent:
 
 Network logic, data processing, and UI are kept in separate modules. The server is a relay; direct peer-to-peer transfer is out of scope.
 
+### Server concurrency
+
+The server receives on one UDP socket and shards datagrams across **16** worker threads. Each worker has a bounded inbox (`Queue` capacity **64**).
+
+- Established connections shard by `connection_id % 16`.
+- `HELLO` (connection ID `0`) shards by peer address hash.
+- If a worker’s queue is full, that datagram is dropped (no blocking of the receive loop).
+
+This keeps same-connection packets ordered on one worker while allowing concurrent handling of different clients.
+
 ## 4. UDP packet format
 
 Every datagram starts with a 16-byte header. All integers are big-endian.
@@ -89,10 +99,10 @@ A `DISCOVER` broadcast packet (`0x08`) for finding the server on the LAN is opti
 
 | Packet | Payload |
 |---|---|
-| `HELLO` | `client_public_key` (32 bytes, X25519), `client_nonce` (16 bytes) |
-| `HELLO_ACK` | `server_public_key` (32 bytes), `server_nonce` (16 bytes) |
+| `HELLO` | `client_public_key` (32 bytes, X25519), `client_nonce` (16 bytes) — **exactly 48 bytes** |
+| `HELLO_ACK` | `server_public_key` (32 bytes), `server_nonce` (16 bytes) — **exactly 48 bytes** |
 
-Both packets are sent without encryption. All other packets use the `ENC` flag once keys are derived (see section 12).
+Both packets are sent without encryption. Empty or truncated HELLO payloads are rejected (no plaintext / zero-key fallback). After a successful handshake, all other packets use the `ENC` flag (see section 12).
 
 ### DATA payload
 
@@ -166,9 +176,9 @@ An idle endpoint sends `PING` after 5 s without sending any packet. The peer ans
 
 ## 7. Connection lifecycle
 
-1. Client sends `HELLO` (up to 3 attempts, 1 s apart).
-2. Server creates the connection entry, assigns `connection_id`, and replies `HELLO_ACK`.
-3. Both sides derive the session keys. The connection is `Established` but not authenticated.
+1. Client sends `HELLO` with a real X25519 public key and nonce (up to 3 attempts, 1 s apart).
+2. Server creates the connection entry, assigns `connection_id`, and replies `HELLO_ACK` with its own X25519 public key and nonce.
+3. Both sides run ECDH + HKDF to derive directional session keys. The connection is `Established` but not authenticated; subsequent packets carry `ENC`.
 4. Client sends `AUTH` on stream 0. The server closes connections that do not authenticate within 10 s.
 5. After successful authentication the server sends `AUTH_ACK`, `USER_LIST`, and notifies other clients with `PRESENCE`.
 6. Client ends the session with `LOGOUT` and `CLOSE`.
@@ -282,15 +292,15 @@ Rules:
 
 ## 12. Security
 
-- Key exchange: X25519 in `HELLO` / `HELLO_ACK`.
-- Key derivation: HKDF-SHA256 with `client_nonce || server_nonce` as salt, producing one key per direction.
-- Payload encryption: AES-256-GCM using the `cryptography` package.
-- Nonce: 1 byte direction, 3 zero bytes, 8 bytes packet number. The 16-byte header is the additional authenticated data.
-- Packets that fail authentication are dropped without a reply.
+- Key exchange: X25519 ECDH in `HELLO` / `HELLO_ACK` (full 32-byte public keys required on both sides).
+- Shared secret: each side computes `ECDH(local_private, peer_public)`.
+- Key derivation: HKDF-SHA256 over the shared secret, salt = `client_nonce || server_nonce`, info = `ccp-session-keys`, length 64 → (`key_c2s`, `key_s2c`).
+- Payload encryption: AES-256-GCM (`cryptography`). After keys are derived, `ENC` is required on DATA and control traffic (HELLO / HELLO_ACK remain plaintext).
+- Nonce: 1 byte direction (`0` client→server, `1` server→client), 3 zero bytes, 8 bytes packet number. The 16-byte header is AAD.
+- Packets that fail authentication, have invalid key material, or omit `ENC` after the handshake are dropped without a reply.
 - Passwords travel only inside encrypted `AUTH` messages and are stored hashed with salt.
 - Limitation: the server relays messages and files, so encryption is hop-by-hop and the server can read the content. End-to-end encryption is out of scope.
 - Limitation: `HELLO` is not authenticated, so a man-in-the-middle attack during the handshake is not prevented. Pinning the server public key in the client configuration is a possible improvement.
-- Encryption can be disabled during early development; the final version must have `ENC` enabled.
 
 ## 13. Web UI and local HTTP API
 ### 13.1 StreapRous constraints
@@ -305,7 +315,7 @@ Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API be
 
 ### 13.2 Conventions
 
-- The agent serves `index.html`, `api.js`, `app.js` (no stylesheet). Page and API share one origin.
+- The agent serves the UI files that sit in the framework folders: `www/chat.html` and `static/api.js`, `static/app.js` (no stylesheet). Open `http://127.0.0.1:8080/chat.html`; `/` stays the framework's sample page. Page and API share one origin.
 - JSON in both directions. Success: `{"ok": true, ...}`. Failure: `{"ok": false, "code": "<section 14 code>", "message": "..."}`, still with HTTP `200`.
 - A command is answered when the agent has accepted it; the result arrives as an event. Not logged in: `NOT_AUTHENTICATED`. Bad JSON or fields: `INVALID_PAYLOAD`.
 
@@ -341,7 +351,7 @@ The server does not echo a sender's own messages, so the UI shows its own messag
 
 ### 13.5 Open issues
 
-- Confirm with the instructor that calling `run_backend_standard` from the agent's own launcher is acceptable (no file in `CO3094_streaprous/` changes).
+- Confirm with the instructor that (a) calling `run_backend_standard` from the agent's own launcher is acceptable, and (b) adding the three UI files to `CO3094_streaprous/www/` and `static/` is acceptable. The agent and the UI files only add files; they do not edit existing framework files.
 - File selection uses a native dialog opened by the agent (Python `tkinter`), because a browser cannot hand a file to this framework (see 13.1). If that is not acceptable, the user would type a file path instead.
 - Received files: the agent should move the verified file to a `downloads/` folder; there is no download endpoint yet.
 
@@ -439,7 +449,9 @@ stateDiagram-v2
 | Initial RTO / minimum RTO | 1 s / 200 ms |
 | Heartbeat interval / timeout | 5 s / 15 s |
 | Authentication deadline | 10 s |
-| `HELLO` attempts | 3 |
+| `HELLO` attempts / retry interval | 3 / 1 s |
+| Server worker threads | 16 |
+| Per-worker datagram queue | 64 (drop when full) |
 | Max retransmissions of the same data | 8 |
 | Max control message | 64 KiB |
 | Server relay buffer per transfer | 256 KiB |
