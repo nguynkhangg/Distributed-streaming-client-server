@@ -17,7 +17,10 @@ from datetime import datetime, timezone
 from enum import IntEnum
 
 try:
+    from ..file_transfer.connection import RECV_WINDOW
     from .auth import UsersFileError, UserStore
+    from .file_relay import FileRelay
+    from .stream_layer import FrameError, StreamReceiver
     from .session_manager import (
         KEY_SIZE,
         MAX_AUTH_FAILURES,
@@ -32,7 +35,10 @@ try:
         SessionState,
     )
 except ImportError:
+    from src.file_transfer.connection import RECV_WINDOW
     from auth import UsersFileError, UserStore
+    from file_relay import FileRelay
+    from stream_layer import FrameError, StreamReceiver
     from session_manager import (
         KEY_SIZE,
         MAX_AUTH_FAILURES,
@@ -93,24 +99,10 @@ class PacketType(IntEnum):
     HELLO = 0x01
     HELLO_ACK = 0x02
     DATA = 0x03
-    AUTH = 0x03
     ACK = 0x04
-    AUTH_ACK = 0x04
     PING = 0x05
-    LOGOUT = 0x05
     PONG = 0x06
-    LOGOUT_ACK = 0x06
     CLOSE = 0x07
-    HEARTBEAT = 0x08
-    MSG_OFFER = 0x0A
-    MSG = 0x0B
-    MSG_ACK = 0x0C
-    FILE_OFFER = 0x14
-    FILE_ACK = 0x15
-    FILE_DATA = 0x16
-    FILE_FIN = 0x17
-    ONLINE_LIST = 0x20
-    ERROR = 0xFF
 
 
 class PacketError(ValueError):
@@ -192,6 +184,8 @@ DEFAULT_PORT = 9000
 RECV_BUFFER = 65535
 SOCKET_TIMEOUT = 1.0
 SWEEP_INTERVAL = 1.0
+MAX_SEGMENT_BYTES = 1000          # data bytes per DATA packet (protocol-spec section 5)
+RESEND_INTERVAL = 0.25         # how often unacknowledged frames are looked at
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 64 * 1024
@@ -207,6 +201,11 @@ STREAM_OF = {
     "LOGOUT_ACK": 0,
     "ERROR": 0,
     "MSG_DELIVER": 1,
+    "FILE_INCOMING": 0,
+    "FILE_ACCEPT": 0,
+    "FILE_READY": 0,
+    "FILE_COMPLETE": 0,
+    "FILE_CANCEL": 0,
 }
 
 
@@ -229,12 +228,24 @@ class CcpServer:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         users: UserStore | None = None,
+        require_encryption: bool = True,
     ) -> None:
+        # With require_encryption (default) every packet after HELLO must be AES-GCM
+        # encrypted and HELLO must carry the client's X25519 key; plain packets are dropped.
+        self._require_encryption = require_encryption
         self._sessions = SessionManager()
         self._users = users if users is not None else UserStore()
         self._presence_lock = threading.Lock()
         self._event_ids = itertools.count(1)
+        self._relay = FileRelay(
+            self._send_message, self._send_error, self._send_file_data,
+            lambda name: self._sessions.get_by_username(name), lambda name: self._users.user_exists(name),
+        )
         self._message_handlers = {
+            "FILE_OFFER": self._relay.on_offer,
+            "FILE_RESPONSE": self._relay.on_response,
+            "FILE_COMPLETE": self._relay.on_complete,
+            "FILE_CANCEL": self._relay.on_cancel,
             "AUTH": self._handle_auth,
             "USER_LIST_REQ": self._handle_user_list_req,
             "MSG": self._handle_msg,
@@ -254,10 +265,6 @@ class CcpServer:
             PacketType.PING: self._on_ping,
             PacketType.PONG: self._on_pong,
             PacketType.CLOSE: self._on_close,
-            PacketType.HEARTBEAT: self._on_ping,
-            PacketType.MSG_OFFER: self._on_data,
-            PacketType.MSG: self._on_data,
-            PacketType.ONLINE_LIST: self._on_data,
         }
         log.info("listening on udp://%s:%d", *self.address)
 
@@ -299,11 +306,21 @@ class CcpServer:
         self._sock.close()
 
     def _sweep_loop(self) -> None:
-        while not self._stop.wait(SWEEP_INTERVAL):
+        tick = 0
+        while not self._stop.wait(RESEND_INTERVAL):
             try:
-                self._sweep_once()
+                self._resend_due()
+                tick += 1
+                if tick * RESEND_INTERVAL >= SWEEP_INTERVAL:
+                    tick = 0
+                    self._sweep_once()
             except Exception:
                 log.exception("sweeper error")
+
+    def _resend_due(self) -> None:
+        now = time.monotonic()
+        self._resend_frames(now)
+        self._relay.resend_late(now)
 
     def _sweep_once(self) -> None:
         now = time.monotonic()
@@ -332,6 +349,11 @@ class CcpServer:
                 addr,
             )
             return
+        with session.lock:       # the worker pool is shared; one client's packets must not interleave
+            self._handle_session_packet(session, header, payload, data, addr)
+
+    def _handle_session_packet(self, session: ClientSession, header: PacketHeader,
+                               payload: bytes, data: bytes, addr: Address) -> None:
 
         if header.flags & FLAG_ENC:
             if session.key_c2s is None:
@@ -357,6 +379,10 @@ class CcpServer:
                 )
                 return
             session.use_encryption = True
+        elif self._require_encryption:
+            log.debug("drop %s from %s: plain packet, encryption is required",
+                      header.packet_type.name, addr)
+            return
         else:
             session.use_encryption = False
 
@@ -369,6 +395,13 @@ class CcpServer:
             )
             return
         session.touch()
+        is_data = header.packet_type is PacketType.DATA
+        is_new = session.ack_tracker.on_packet(header.packet_number, is_data, time.monotonic())
+        if is_data:
+            if is_new:                      # a resent packet is acknowledged again but not processed twice
+                self._on_data(session, payload, header.flags)
+            self._send(session, PacketType.ACK, session.ack_tracker.build_ack(RECV_WINDOW))
+            return
         handler(session, payload)
 
     def _on_hello(self, header: PacketHeader, payload: bytes, addr: Address) -> None:
@@ -376,6 +409,9 @@ class CcpServer:
             log.debug("drop HELLO from %s: connection_id must be 0", addr)
             return
         if not payload:
+            if self._require_encryption:
+                log.debug("drop HELLO from %s: encryption is required, HELLO has no key", addr)
+                return
             client_key, client_nonce = bytes(KEY_SIZE), bytes(NONCE_SIZE)
         elif len(payload) == KEY_SIZE + NONCE_SIZE:
             client_key, client_nonce = payload[:KEY_SIZE], payload[KEY_SIZE:]
@@ -439,46 +475,42 @@ class CcpServer:
         if result is not None:
             self._handle_removed(result, "client CLOSE")
 
-    def _on_data(self, session: ClientSession, payload: bytes) -> None:
+    def _on_data(self, session: ClientSession, payload: bytes, flags: int = 0) -> None:
         if not payload:
             return
-        # Support direct unframed JSON as well as stream-framed DATA segments
+        # Support direct unframed JSON (used by tests) as well as stream-framed DATA segments
         if payload.lstrip().startswith(b"{"):
             self._dispatch_control_json(session, payload)
             return
         if len(payload) < STREAM_HEADER_SIZE:
             log.debug("drop short DATA segment (%d bytes) from %s", len(payload), session.address)
             return
-        stream_id, _offset = struct.unpack(STREAM_HEADER_FORMAT, payload[:STREAM_HEADER_SIZE])
+        stream_id, offset = struct.unpack(STREAM_HEADER_FORMAT, payload[:STREAM_HEADER_SIZE])
         stream_body = payload[STREAM_HEADER_SIZE:]
         if stream_id in (0, 1):
-            for frame_bytes in self._extract_stream_frames(stream_body):
+            receiver = session.recv_streams.setdefault(stream_id, StreamReceiver())
+            try:
+                frames = receiver.feed(offset, stream_body)
+            except FrameError as exc:
+                log.debug("protocol error on stream %d from %s: %s", stream_id, session.address, exc)
+                self._close_session(session, CloseReason.PROTOCOL_ERROR, "bad frame")
+                return
+            for frame_bytes in frames:
                 self._dispatch_control_json(session, frame_bytes)
-
-    @staticmethod
-    def _extract_stream_frames(stream_body: bytes) -> list[bytes]:
-        if stream_body.lstrip().startswith(b"{"):
-            return [stream_body.lstrip()]
-        frames: list[bytes] = []
-        cursor = 0
-        total = len(stream_body)
-        while cursor + 4 <= total:
-            (frame_len,) = struct.unpack("!I", stream_body[cursor : cursor + 4])
-            cursor += 4
-            if frame_len == 0 or cursor + frame_len > total:
-                break
-            frames.append(stream_body[cursor : cursor + frame_len])
-            cursor += frame_len
-        return frames
+        elif session.state is SessionState.AUTHENTICATED:
+            self._relay.on_data(session, stream_id, offset, stream_body, bool(flags & FLAG_FIN))
 
     def _on_ack(self, session: ClientSession, payload: bytes) -> None:
         log.debug("ACK from %s (%d bytes)", session.address, len(payload))
+        session.send_buf.on_ack(payload)
+        self._relay.on_ack(session, payload)
 
     # ---- session removal & presence helpers ---------------------------
 
     def _handle_removed(self, result: RemoveResult, why: str) -> None:
         session = result.session
         log.info("session %08x (%s:%d) closed: %s", session.connection_id, *session.address, why)
+        self._relay.on_session_closed(session)
         if result.went_offline:
             with self._presence_lock:
                 self._fan_out(
@@ -762,17 +794,42 @@ class CcpServer:
         self._send_frame(session, STREAM_OF[msg_type], struct.pack("!I", len(body)) + body)
 
     def _send_frame(self, session: ClientSession, stream_id: int, frame: bytes) -> None:
-        offset = session.stream_offsets.get(stream_id, 0)
-        session.stream_offsets[stream_id] = offset + len(frame)
-        stream_header = struct.pack(STREAM_HEADER_FORMAT, stream_id, offset)
-        self._send(session, PacketType.DATA, stream_header + frame)
+        with session.send_lock:          # offset and packet number must follow the same order
+            for start in range(0, len(frame), MAX_SEGMENT_BYTES):     # one datagram holds at most 1000 data bytes
+                chunk = frame[start:start + MAX_SEGMENT_BYTES]
+                offset = session.send_buf.next_offset(stream_id, len(chunk))
+                number = self._send(
+                    session, PacketType.DATA, struct.pack(STREAM_HEADER_FORMAT, stream_id, offset) + chunk
+                )
+                session.send_buf.remember(number, stream_id, offset, chunk, time.monotonic())
+
+    def _resend_frames(self, now: float) -> None:
+        """Send again the control/chat frames that the client has not acknowledged."""
+        for session in self._sessions.all_sessions():
+            for item in session.send_buf.take_due(now):
+                with session.send_lock:
+                    number = self._send(
+                        session, PacketType.DATA,
+                        struct.pack(STREAM_HEADER_FORMAT, item.stream_id, item.offset) + item.frame,
+                    )
+                    item.resends += 1
+                    item.sent_at = now
+                    session.send_buf.remember(number, item.stream_id, item.offset, item.frame, now)
+
+    def _send_file_data(self, session: ClientSession, stream_id: int, offset: int,
+                        data: bytes, fin: bool) -> int:
+        """Send one file segment on the receiver's stream; returns the packet number used."""
+        return self._send(session, PacketType.DATA,
+                          struct.pack(STREAM_HEADER_FORMAT, stream_id, offset) + data,
+                          FLAG_FIN if fin else 0)
 
     def _send(
         self,
         session: ClientSession,
         packet_type: PacketType,
         payload: bytes = b"",
-    ) -> None:
+        extra_flags: int = 0,
+    ) -> int:
         pn = session.allocate_packet_number()
         use_enc = (
             session.use_encryption
@@ -786,7 +843,7 @@ class CcpServer:
                 MAGIC,
                 VERSION,
                 int(packet_type),
-                FLAG_ENC,
+                FLAG_ENC | extra_flags,
                 0,
                 session.connection_id,
                 pn,
@@ -795,11 +852,12 @@ class CcpServer:
             body = seal(session.key_s2c, pn, header16, payload, direction=DIR_S2C)
             raw = header16 + body
         else:
-            raw = pack_packet(packet_type, session.connection_id, pn, payload, 0)
+            raw = pack_packet(packet_type, session.connection_id, pn, payload, extra_flags)
         try:
             self._sock.sendto(raw, session.address)
         except OSError as exc:
             log.warning("send %s to %s failed: %s", packet_type.name, session.address, exc)
+        return pn
 
     def _send_close(self, session: ClientSession, reason: CloseReason) -> None:
         self._send(session, PacketType.CLOSE, bytes([reason]))
@@ -828,6 +886,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="create the demo accounts with this password if they are missing",
     )
     parser.add_argument(
+        "--allow-plaintext",
+        action="store_true",
+        help="development only: also accept packets that are not encrypted (default: drop them)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -851,7 +914,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("cannot prepare the user store: %s", exc)
         return 1
     try:
-        server = CcpServer(args.host, args.port, users)
+        server = CcpServer(args.host, args.port, users, require_encryption=not args.allow_plaintext)
     except OSError as exc:
         log.error("cannot bind %s:%d: %s", args.host, args.port, exc)
         return 1

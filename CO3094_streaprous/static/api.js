@@ -7,12 +7,12 @@
  * Trang phải được agent phục vụ (cùng origin, 127.0.0.1) để các lời gọi /api/... tới được agent.
  *
  * ================= HỢP ĐỒNG VỚI AGENT (xem protocol-spec.md mục 13) =================
- * Agent chạy trên StreapRous của thầy (không được sửa): route khớp đúng đường dẫn nên KHÔNG có
+ * Agent chạy trên framework StreapRous của môn học (không sửa file có sẵn): route khớp đúng đường dẫn nên KHÔNG có
  * ?query, MỌI lệnh là POST với body JSON, body phải nhỏ (< 350 byte), mã HTTP luôn là 200.
  *   POST /api/login          {username, password}      -> {ok}; kết quả đến sau qua sự kiện "auth_ack"
  *   POST /api/send           {target, text}            -> {ok}   (target "*" = gửi cho tất cả; text <= 250 byte UTF-8)
- *   POST /api/file/offer     {target}                  -> {ok, ref, filename, size_bytes}
- *                            (agent tự mở hộp thoại chọn file của hệ điều hành; ref = null nếu đóng hộp thoại)
+ *   POST /api/file/offer     {target, filename}        -> {ok, ref, filename, size_bytes}
+ *                            (filename là tên file nằm trong thư mục "share" của agent; ref = id của lượt gửi)
  *   POST /api/file/respond   {file_id, accepted}       -> {ok}   (nhận / từ chối file đến)
  *   POST /api/logout         {}                        -> {ok}
  *   POST /api/events         {since}  long-polling     -> {events: [...], next: <n>}
@@ -47,7 +47,7 @@ const Api = {
   send: (target, text) => post("/api/send", { target, text }),
   respondFile: (file_id, accepted) => post("/api/file/respond", { file_id, accepted }),
   logout: () => post("/api/logout", {}),
-  offerFile: (target) => post("/api/file/offer", { target }),
+  offerFile: (target, filename) => post("/api/file/offer", { target, filename }),
 
   /** Long-poll loop. onEvents(list) per batch; onLink(true|false) when the agent is (un)reachable. */
   startEvents(onEvents, onLink) {

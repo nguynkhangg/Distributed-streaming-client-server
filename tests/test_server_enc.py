@@ -22,7 +22,7 @@ from src.server.session_manager import KEY_SIZE, NONCE_SIZE  # noqa: E402
 
 class TestServerEncBeforeKeys(unittest.TestCase):
     def setUp(self) -> None:
-        self.server = CcpServer("127.0.0.1", 0)
+        self.server = CcpServer("127.0.0.1", 0, require_encryption=False)   # these tests send a HELLO without a key
         self.addr = ("127.0.0.1", 54321)
 
     def tearDown(self) -> None:

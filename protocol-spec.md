@@ -40,7 +40,7 @@ Components:
 | Component | Role |
 |---|---|
 | Server | One UDP socket (default port 9000). Tracks sessions, routes messages, relays files |
-| Client agent | One UDP socket towards the server and a raw-socket HTTP server bound to 127.0.0.1. Implements all protocol logic |
+| Client agent | One UDP socket towards the server and an HTTP server on the StreapRous raw-socket TCP, bound to the machine's own network address (the raw-socket mode refuses `127.0.0.1`, see 13.1). Implements all protocol logic |
 | Browser UI | HTML and client-side JavaScript only. Displays state and sends user commands to the agent |
 
 Layers inside the server and the agent:
@@ -143,12 +143,13 @@ Each stream has its own receive buffer. Out-of-order segments wait until the gap
 - Lost data is resent in a new packet. Only the missing data is retransmitted.
 - The receiver sends an `ACK` after every 2 `DATA` packets, after 25 ms, or immediately when a gap is detected.
 - If the same data is retransmitted 8 times without acknowledgment, the connection is closed with reason `1` and active file transfers fail.
+- The server applies the same rules to streams 0 and 1 in both directions: it acknowledges every `DATA` packet, orders segments by `offset`, ignores a segment whose offset it already has (a resent packet has a new packet number but the same offset), and cuts the byte stream into frames. Control and chat frames that the client has not acknowledged within 0.5 s are sent again with a new packet number (at most 8 times). A frame is split into segments of at most 1000 bytes. The server also copies file segments from the sender's stream to the receiver's stream and resends the ones the receiver does not acknowledge.
 
 ### RTO
 RFC 6298 style: `RTO = SRTT + 4 * RTTVAR`. Initial value 1 s, minimum 200 ms, doubled after each timeout. RTT samples are taken only from packets that were sent once.
 
 ### Flow control
-Send window = `min(cwnd, recv_window)` using the `recv_window` from the latest `ACK`. Flow control is per connection. Per-stream flow control is not defined in this version.
+Send window = `min(cwnd, recv_window)` using the `recv_window` from the latest `ACK`. Flow control is per connection. Per-stream flow control is not defined in this version. The server advertises a fixed `recv_window` of 256 packets in every `ACK` it sends.
 
 ### Congestion control
 Planned in stages:
@@ -167,7 +168,7 @@ An idle endpoint sends `PING` after 5 s without sending any packet. The peer ans
 ## 7. Connection lifecycle
 
 1. Client sends `HELLO` (up to 3 attempts, 1 s apart).
-2. Server creates the connection entry, assigns `connection_id`, and replies `HELLO_ACK`.
+2. Server creates the connection entry, assigns `connection_id`, and replies `HELLO_ACK`. A `HELLO` without a client public key is ignored (encryption is required, see section 12).
 3. Both sides derive the session keys. The connection is `Established` but not authenticated.
 4. Client sends `AUTH` on stream 0. The server closes connections that do not authenticate within 10 s.
 5. After successful authentication the server sends `AUTH_ACK`, `USER_LIST`, and notifies other clients with `PRESENCE`.
@@ -269,7 +270,7 @@ Sender A, receiver B, server S. S relays the data over two independent reliable 
 3. B answers with `FILE_RESPONSE`. S informs A with `FILE_ACCEPT`. If rejected, the transfer ends (`FILE_REJECTED`).
 4. If accepted, S assigns one file stream on each connection and sends `FILE_READY` to both. The stream IDs may differ per connection. `chunk_size` is 1000.
 5. A writes the file into its stream. The stream layer splits it into `DATA` packets with offsets; the last one carries `FIN`.
-6. S reads from A's stream and writes to B's stream. The relay buffer per transfer is bounded (proposed 256 KiB). When B's side is slow, the buffer fills, S reduces the `recv_window` it advertises to A, and A slows down.
+6. S copies each segment from A's stream to B's stream as soon as it arrives, keeping the offset and the `FIN` flag. Segments that B does not acknowledge within 0.5 s are sent again (up to 8 times). **Not implemented:** the bounded relay buffer (proposed 256 KiB) and slowing A down through `recv_window`; the server forwards at once and keeps no file data.
 7. B writes received bytes to a temporary file at the given offsets. When `FIN` is received and no gap remains, B checks file size and SHA-256, then sends `FILE_COMPLETE`. S forwards the result to A.
 8. Either side can send `FILE_CANCEL`. If the connection dies during a transfer, the transfer fails and the partial file is deleted.
 
@@ -279,6 +280,13 @@ Rules:
 - A transfer is successful only after the receiver verifies file size and SHA-256 and completion is reported.
 - Reject `DATA` for unknown streams, offsets beyond the announced file size, and invalid payload lengths.
 - Duplicate segments must not change the received file.
+
+Implementation notes (`src/server/file_relay.py`):
+- The server assigns file stream IDs per connection, starting at 4 and increasing by one for each accepted transfer on that connection.
+- `FILE_OFFER` needs `target`, `filename`, `size_bytes` (0 to 1 GiB) and a 64-digit hexadecimal `sha256`; otherwise the server answers `ERROR: INVALID_PAYLOAD`. An unknown target or the sender's own name gives `USER_NOT_FOUND`; a known user who is offline gives `USER_OFFLINE`.
+- `FILE_ACCEPT` and a later `ERROR` for the offer carry the `id` of the sender's `FILE_OFFER`, so the sender can match them. A rejection is reported as `FILE_ACCEPT` with `accepted: false` and an `error` text.
+- If either user disconnects during a transfer, the server sends `FILE_CANCEL` (reason `the other user disconnected`) to the other one and forgets the transfer.
+- A reply for a transfer the server does not know (`FILE_RESPONSE`, `FILE_COMPLETE`, `FILE_CANCEL`) is `ERROR: TRANSFER_NOT_FOUND`.
 
 ## 12. Security
 
@@ -290,14 +298,14 @@ Rules:
 - Passwords travel only inside encrypted `AUTH` messages and are stored hashed with salt.
 - Limitation: the server relays messages and files, so encryption is hop-by-hop and the server can read the content. End-to-end encryption is out of scope.
 - Limitation: `HELLO` is not authenticated, so a man-in-the-middle attack during the handshake is not prevented. Pinning the server public key in the client configuration is a possible improvement.
-- Encryption can be disabled during early development; the final version must have `ENC` enabled.
+- The server requires encryption: after `HELLO` a packet without the `ENC` flag is dropped, and a `HELLO` without a client key is ignored. The server option `--allow-plaintext` turns this off for development only.
 
 ## 13. Web UI and local HTTP API
 ### 13.1 StreapRous constraints
 
 Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API below is shaped by them.
 
-- **Start-up:** the stock `create_backend()` rejects `127.0.0.1` (and any other address needs raw sockets and root). The agent's own launcher calls `daemon.backend.run_backend_standard(ip, port, app.routes)` instead: normal sockets, one thread per connection, no root.
+- **Start-up:** the assignment requires HTTP over raw sockets, so the agent calls the stock `daemon.backend.create_backend(ip, port, app.routes)`: Linux, root, and an address that is not `127.0.0.1`. Tested on WSL2 with the browser on Windows. Two host settings are needed: the WSL interface MTU must be 1500 (default 1280 makes the framework's 1460-byte segments fail with `Message too long`), and the kernel's RST for the agent port must be dropped (`iptables -A OUTPUT -p tcp --sport <port> --tcp-flags RST RST -j DROP`). The agent has no other mode: normal OS TCP sockets are not accepted.
 - **Routes match the exact path.** `?query` and path parameters give `404`, so every parameter travels in a JSON body and every API call is a `POST`.
 - **A request is read with one `recv(1024)`, headers included.** Chrome headers take about 600 bytes, so the JSON body must stay **under 350 bytes** (400 B worked 15/15, 500 B failed 15/15). Chat text is limited to **250 bytes of UTF-8**.
 - **The status line is always `HTTP/1.1 200`.** Errors are reported in the body only.
@@ -315,12 +323,12 @@ Measured on Windows (Python 3.11, Chrome) against an unmodified copy. The API be
 |---|---|---|---|
 | `/api/login` | `{"username", "password"}` | `{"ok": true}` | `HELLO` if disconnected, then `AUTH`. Result: `auth_ack` event |
 | `/api/send` | `{"target", "text"}` (`target` is `"*"` or a username; text up to 250 bytes) | `{"ok": true}` | `MSG`. Unknown/offline target: `error` event |
-| `/api/file/offer` | `{"target"}` | `{"ok": true, "ref": "<id>", "filename", "size_bytes"}`, or `"ref": null` if the user closes the dialog | The agent opens a native file dialog on this machine, computes size and SHA-256, sends `FILE_OFFER` |
+| `/api/file/offer` | `{"target", "filename"}` (`filename` is a file name inside the agent's `share` folder) | `{"ok": true, "ref": "<id>", "filename", "size_bytes"}` | The client computes size and SHA-256 and sends `FILE_OFFER` |
 | `/api/file/respond` | `{"file_id", "accepted"}` | `{"ok": true}` | `FILE_RESPONSE` |
 | `/api/logout` | `{}` | `{"ok": true}` | `LOGOUT`, `CLOSE` |
 | `/api/events` | `{"since": <n>}` | `{"events": [...], "next": <n>}` | - |
 
-The server does not echo a sender's own messages, so the UI shows its own message locally after `ok`. File bytes never pass through the browser: the agent reads the chosen file itself. `ref` identifies a sent file until the server assigns `file_id`. If the server refuses an offer, the agent sends an `error` event and a `file` event with `state: "rejected"`.
+The server does not echo a sender's own messages, so the UI shows its own message locally after `ok`. File bytes never pass through the browser: the agent reads the file itself, and only from its `share` folder (a name that leaves the folder is refused with `INVALID_PAYLOAD`). `ref` is the id of a sent file; the `file` events of that transfer carry the same value as `file_id`. If the server refuses an offer, the agent sends an `error` event and a `file` event with `state: "rejected"`.
 
 ### 13.4 Events (long-polling)
 
@@ -341,8 +349,9 @@ The server does not echo a sender's own messages, so the UI shows its own messag
 
 ### 13.5 Open issues
 
-- Confirm with the instructor that (a) calling `run_backend_standard` from the agent's own launcher is acceptable, and (b) adding the three UI files to `CO3094_streaprous/www/` and `static/` is acceptable. The agent and the UI files only add files; they do not edit existing framework files.
-- File selection uses a native dialog opened by the agent (Python `tkinter`), because a browser cannot hand a file to this framework (see 13.1). If that is not acceptable, the user would type a file path instead.
+- Open point: adding the three UI files to `CO3094_streaprous/www/` and `static/` needs to be confirmed as acceptable. The agent and the UI files only add files; they do not edit existing framework files.
+- File selection: a browser cannot hand a file to this framework (see 13.1), so the user types the name of a file placed in the agent's `share` folder. Restricting the agent to that folder matters because the raw-socket API listens on a LAN address and has no login of its own: without it anyone on the network could ask the agent to send any file of the machine.
+- The local API is not authenticated: anyone who can reach the agent's port can act as the logged-in user. Acceptable for a LAN demo, not for a real deployment.
 - Received files: the agent should move the verified file to a `downloads/` folder; there is no download endpoint yet.
 
 ## 14. Error codes
@@ -424,7 +433,8 @@ stateDiagram-v2
 
 - For valid `LOGOUT`, send `LOGOUT_ACK`, remove session, emit offline presence, and send `CLOSE`.
 - Unexpected disconnects and heartbeat timeouts must also clean up sessions and active transfers.
-- Packets with a wrong magic, version, connection ID, or failed decryption are dropped.
+- Packets with a wrong magic, version, connection ID, or failed decryption are dropped, and so are packets without the `ENC` flag after `HELLO`.
+- A message frame with length 0 or above 64 KiB on stream 0 or 1 is a protocol error: the server closes the connection with reason `2`.
 - Socket errors, malformed packets, timeouts, and cancellations must not crash the server or affect unrelated clients. The receive loop catches exceptions, logs them, and continues.
 
 ## 17. Default parameters (tunable)
@@ -442,5 +452,8 @@ stateDiagram-v2
 | `HELLO` attempts | 3 |
 | Max retransmissions of the same data | 8 |
 | Max control message | 64 KiB |
-| Server relay buffer per transfer | 256 KiB |
+| Server relay buffer per transfer | not used (segments are forwarded at once) |
+| Server resend of control, chat and file segments | after 0.5 s without `ACK`, at most 8 times; checked every 0.25 s |
+| Server `recv_window` | 256 packets (fixed) |
+| Maximum file size accepted by the server | 1 GiB |
 

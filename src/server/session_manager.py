@@ -16,6 +16,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 
+try:
+    from ..file_transfer.reliability import AckTracker
+    from .stream_layer import SendBuffer, StreamReceiver
+except ImportError:
+    from src.file_transfer.reliability import AckTracker
+    from stream_layer import SendBuffer, StreamReceiver
+
 Address = tuple[str, int]
 
 AUTH_DEADLINE = 10.0          # seconds after handshake to send AUTH (section 7)
@@ -78,7 +85,16 @@ class ClientSession:
     key_s2c: bytes | None = None
     use_encryption: bool = False
     wire_mode: str = "packet"
-    stream_offsets: dict[int, int] = field(default_factory=dict)
+    # Packet numbers received from this client: used to ACK DATA and drop resent duplicates.
+    ack_tracker: AckTracker = field(default_factory=AckTracker, repr=False)
+    # Client -> server control/chat streams (by stream id): ordering, duplicates, framing.
+    recv_streams: dict[int, StreamReceiver] = field(default_factory=dict, repr=False)
+    # Server -> client control/chat frames waiting for an ACK, and their next offsets.
+    send_buf: SendBuffer = field(default_factory=SendBuffer, repr=False)
+    # Datagrams of one client are handled one at a time (the worker pool is shared).
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    # Taken while a frame gets its offset and packet number, so both stay in the same order.
+    send_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     created_at: float = field(default_factory=time.monotonic)
     last_recv: float = field(default_factory=time.monotonic)
     last_send: float = field(default_factory=time.monotonic)
@@ -188,6 +204,10 @@ class SessionManager:
         with self._lock:
             connection_id = self._by_username.get(username)
             return self._by_id.get(connection_id) if connection_id is not None else None
+
+    def all_sessions(self) -> list[ClientSession]:
+        with self._lock:
+            return list(self._by_id.values())
 
     def authenticated_sessions(self) -> list[ClientSession]:
         with self._lock:
