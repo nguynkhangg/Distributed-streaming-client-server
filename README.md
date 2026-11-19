@@ -127,7 +127,7 @@ The page is `http://<IP of the Linux machine>:8080/chat.html` (get the IP with `
 **Command-line client.** The messaging CLI can be used without a browser:
 
 ```bash
-python -m src.client.client --host 127.0.0.1 --port 9000
+python3 -m src.client.client --host 127.0.0.1 --port 9000
 ```
 
 It prompts for a username and password. Use `/broadcast <message>` to message all
@@ -142,7 +142,7 @@ The username must already exist in the server's configured user store.
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
-Known limitations at the time of writing: file transfer is not wired into the server and client yet (the page reports that it is not implemented), and the client does not enable payload encryption yet.
+Known limitation at the time of writing: file transfer is not wired into the server and client yet (the page reports that it is not implemented).
 
 ## 7. Protocol Documentation
 
